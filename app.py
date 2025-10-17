@@ -1102,13 +1102,13 @@ def fetch_commit_current_status(commit_url, token):
     """
     try:
         # Convert HTML URL to API URL
-        # https://github.com/owner/repo/issues/123 -> https://api.github.com/repos/owner/repo/issues/123
-        parts = issue_url.replace('https://github.com/', '').split('/')
+        # https://github.com/owner/repo/commits/123 -> https://api.github.com/repos/owner/repo/commits/123
+        parts = commit_url.replace('https://github.com/', '').split('/')
         if len(parts) < 4:
             return None
 
-        owner, repo, issue_word, issue_number = parts[0], parts[1], parts[2], parts[3]
-        api_url = f'https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}'
+        owner, repo, commit_word, commit_number = parts[0], parts[1], parts[2], parts[3]
+        api_url = f'https://api.github.com/repos/{owner}/{repo}/commits/{commit_number}'
 
         headers = {'Authorization': f'token {token}'} if token else {}
         response = request_with_backoff('GET', api_url, headers=headers, max_retries=3)
@@ -1116,10 +1116,10 @@ def fetch_commit_current_status(commit_url, token):
         if response is None or response.status_code != 200:
             return None
 
-        issue_data = response.json()
-        state = issue_data.get('state')
-        state_reason = issue_data.get('state_reason')
-        closed_at = issue_data.get('closed_at')
+        commit_data = response.json()
+        state = commit_data.get('state')
+        state_reason = commit_data.get('state_reason')
+        closed_at = commit_data.get('closed_at')
 
         return {
             'state': state,
@@ -1128,7 +1128,7 @@ def fetch_commit_current_status(commit_url, token):
         }
 
     except Exception as e:
-        print(f"   Error fetching commit status for {issue_url}: {str(e)}")
+        print(f"   Error fetching commit status for {commit_url}: {str(e)}")
         return None
 
 
@@ -1139,7 +1139,7 @@ def refresh_commit_status_for_agent(agent_identifier, token):
 
     This implements the smart update strategy:
     - Skip commits that are already closed/resolved
-    - Fetch current status for open issues
+    - Fetch current status for open commits
     - Update and save back to daily files
 
     Args:
@@ -1189,27 +1189,26 @@ def refresh_commit_status_for_agent(agent_identifier, token):
                         updated_commits.append(commit)
                         continue
 
-                    # Issue is open, fetch current status
                     # Commit may have been reverted, check status
                     commit_url = commit.get("html_url")
 
-                    if not issue_url:
-                        updated_issues.append(issue)
+                    if not commit_url:
+                        updated_commits.append(commit)
                         continue
 
-                    current_status = fetch_issue_current_status(issue_url, token)
+                    current_status = fetch_commit_current_status(commit_url, token)
 
                     if current_status:
                         # Check if status changed (now closed)
                         if current_status['state'] == 'closed':
-                            print(f"   ✓ Issue status changed: {issue_url}")
-                            issue['state'] = current_status['state']
-                            issue['state_reason'] = current_status['state_reason']
-                            issue['closed_at'] = current_status['closed_at']
+                            print(f"   ✓ Commit status changed: {commit_url}")
+                            commit['state'] = current_status['state']
+                            commit['state_reason'] = current_status['state_reason']
+                            commit['closed_at'] = current_status['closed_at']
                             updated_count += 1
                             file_had_updates = True
 
-                    updated_issues.append(issue)
+                    updated_commits.append(commit)
                     time.sleep(0.1)  # Rate limiting courtesy delay
 
                 # Save file if there were updates
@@ -1219,7 +1218,7 @@ def refresh_commit_status_for_agent(agent_identifier, token):
                     local_filename = parts[-1]  # Just YYYY.MM.DD.jsonl
 
                     # Save locally
-                    save_jsonl(local_filename, updated_issues)
+                    save_jsonl(local_filename, updated_commits)
 
                     try:
                         # Upload back to HuggingFace
@@ -1228,7 +1227,7 @@ def refresh_commit_status_for_agent(agent_identifier, token):
                             api=api,
                             path_or_fileobj=local_filename,
                             path_in_repo=filename,
-                            repo_id=ISSUE_METADATA_REPO,
+                            repo_id=COMMIT_METADATA_REPO,
                             repo_type="dataset",
                             token=get_hf_token()
                         )
@@ -1545,7 +1544,7 @@ def initialize_data():
     print(f"📂 Checking {COMMIT_METADATA_REPO} for existing data...")
     try:
         cache_dict = construct_leaderboard_from_metadata()
-        # Check if there's actually meaningful data (at least one agent with issues)
+        # Check if there's actually meaningful data (at least one agent with commits)
         has_data = any(entry.get('total_commits', 0) > 0 for entry in cache_dict.values())
         if cache_dict and has_data:
             print(f"✓ Found existing commit metadata. Leaderboard constructed from {COMMIT_METADATA_REPO}")
@@ -1655,11 +1654,11 @@ def create_monthly_metrics_plot():
             )
 
         # Add bar trace for total commits (right y-axis)
-        # Only show bars for months where agent has issues
+        # Only show bars for months where agent has commits
         x_bars = []
         y_bars = []
         for month, count in zip(months, agent_data['total_commits']):
-            if count > 0:  # Only include months with issues
+            if count > 0:  # Only include months with commits
                 x_bars.append(month)
                 y_bars.append(count)
 

@@ -1,6 +1,6 @@
 ---
 title: SWE-Commit
-emoji: 😻
+emoji: 💻
 colorFrom: gray
 colorTo: yellow
 sdk: gradio

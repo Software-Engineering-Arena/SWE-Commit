@@ -192,12 +192,17 @@ def check_single_commit_revert_status(sha, headers):
 
 def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, end_date=None):
     """
-    Check revert status for all commits using batch approach (MUCH more efficient).
-    Returns the same format as check_single_commit_revert_status() but for all commits at once.
+    Check revert status for commits using SCOPED batch approach (highly efficient).
 
-    This function fetches ALL revert commits in the time range with ~10-20 API calls,
-    then matches them against the provided commits. This is 98% more efficient than
-    checking each commit individually.
+    Strategy:
+    - Groups commits into batches of ~50 SHAs
+    - For each batch, searches for reverts mentioning those specific SHAs
+    - This targets only relevant reverts instead of fetching ALL reverts in time range
+    - Avoids the "8 million reverts" problem while staying efficient
+
+    API calls: ~(num_commits / 50) * 2, typically 10-40 calls for 1000 commits
+    This is 95%+ more efficient than per-commit checking, and scales with YOUR commits
+    instead of scaling with ALL reverts in the ecosystem.
 
     Args:
         commits_by_sha: Dict of commits keyed by SHA
@@ -211,75 +216,92 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
     if not commits_by_sha:
         return {}
 
-    print(f"   🔍 Batch checking revert status for {len(commits_by_sha)} commits...")
+    print(f"   🔍 Scoped batch checking revert status for {len(commits_by_sha)} commits...")
 
-    # Build query for ALL revert commits
-    revert_query = '"This reverts commit"'
-
-    # Add date range if provided (to narrow down search)
-    if start_date and end_date:
-        start_str = start_date.strftime('%Y-%m-%d')
-        end_str = end_date.strftime('%Y-%m-%d')
-        revert_query += f' committer-date:{start_str}..{end_str}'
-
-    # Fetch ALL revert commits
-    revert_commits = []
-    page = 1
-    per_page = 100
-
-    while True:
-        url = 'https://api.github.com/search/commits'
-        params = {
-            'q': revert_query,
-            'per_page': per_page,
-            'page': page,
-            'sort': 'committer-date',
-            'order': 'asc'
-        }
-
-        headers_with_accept = headers.copy() if headers else {}
-        headers_with_accept['Accept'] = 'application/vnd.github.cloak-preview+json'
-
-        response = request_with_backoff('GET', url, headers=headers_with_accept, params=params, max_retries=3)
-
-        if not response or response.status_code != 200:
-            break
-
-        data = response.json()
-        items = data.get('items', [])
-
-        if not items:
-            break
-
-        revert_commits.extend(items)
-
-        # GitHub API limit: max 1000 results, max 10 pages
-        if len(items) < per_page or page >= 10:
-            break
-
-        page += 1
-        time.sleep(0.5)  # Courtesy delay
-
-    print(f"   📋 Found {len(revert_commits)} total revert commits in time range")
-
-    # Parse revert commits to extract which SHAs they revert
+    # Group commits into batches for scoped searching
+    BATCH_SIZE = 50  # Search for up to 50 SHAs at once
+    commit_shas = list(commits_by_sha.keys())
     revert_map = {}  # {reverted_sha: revert_date}
 
     import re
-    for revert_commit in revert_commits:
-        message = revert_commit.get('commit', {}).get('message', '')
-        revert_date = revert_commit.get('commit', {}).get('author', {}).get('date')
 
-        # Extract SHA from message: "This reverts commit abc1234" or similar patterns
-        # Match both abbreviated (7 chars) and full SHA (40 chars)
-        matches = re.findall(r'\b([0-9a-f]{7,40})\b', message.lower())
+    # Process commits in batches
+    num_batches = (len(commit_shas) + BATCH_SIZE - 1) // BATCH_SIZE
 
-        for sha in matches:
-            # Store first (earliest) revert date for each SHA
-            if sha not in revert_map:
-                revert_map[sha] = revert_date
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * BATCH_SIZE
+        end_idx = min(start_idx + BATCH_SIZE, len(commit_shas))
+        batch_shas = commit_shas[start_idx:end_idx]
 
-    print(f"   📌 Identified {len(revert_map)} unique reverted commit SHAs")
+        # Build query for this batch of SHAs
+        # Search for: "This reverts commit <sha1>" OR "This reverts commit <sha2>" ...
+        sha_queries = []
+        for sha in batch_shas:
+            sha_abbr = sha[:7]
+            sha_queries.append(f'"This reverts commit {sha_abbr}"')
+
+        # Combine with OR (GitHub search supports this)
+        revert_query = ' OR '.join(sha_queries)
+
+        # Add date range if provided
+        if start_date and end_date:
+            start_str = start_date.strftime('%Y-%m-%d')
+            end_str = end_date.strftime('%Y-%m-%d')
+            revert_query += f' committer-date:{start_str}..{end_str}'
+
+        # Fetch revert commits for this batch
+        page = 1
+        per_page = 100
+
+        while True:
+            url = 'https://api.github.com/search/commits'
+            params = {
+                'q': revert_query,
+                'per_page': per_page,
+                'page': page,
+                'sort': 'committer-date',
+                'order': 'asc'
+            }
+
+            headers_with_accept = headers.copy() if headers else {}
+            headers_with_accept['Accept'] = 'application/vnd.github.cloak-preview+json'
+
+            response = request_with_backoff('GET', url, headers=headers_with_accept, params=params, max_retries=3)
+
+            if not response or response.status_code != 200:
+                break
+
+            data = response.json()
+            items = data.get('items', [])
+
+            if not items:
+                break
+
+            # Parse revert commits
+            for revert_commit in items:
+                message = revert_commit.get('commit', {}).get('message', '')
+                revert_date = revert_commit.get('commit', {}).get('author', {}).get('date')
+
+                # Extract SHA from message
+                matches = re.findall(r'\b([0-9a-f]{7,40})\b', message.lower())
+
+                for sha in matches:
+                    # Store first (earliest) revert date for each SHA
+                    if sha not in revert_map:
+                        revert_map[sha] = revert_date
+
+            # GitHub API limit: max 1000 results, max 10 pages
+            if len(items) < per_page or page >= 10:
+                break
+
+            page += 1
+            time.sleep(0.3)  # Courtesy delay
+
+        # Delay between batches to avoid rate limiting
+        if batch_idx < num_batches - 1:
+            time.sleep(0.5)
+
+    print(f"   📌 Identified {len(revert_map)} reverted commits")
 
     # Build results for our commits
     results = {}
@@ -300,7 +322,7 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
             }
 
     reverted_count = sum(1 for r in results.values() if r['is_reverted'])
-    print(f"   ✅ Batch revert check complete: {reverted_count}/{len(results)} commits were reverted")
+    print(f"   ✅ Scoped batch check complete: {reverted_count}/{len(results)} commits were reverted")
 
     return results
 

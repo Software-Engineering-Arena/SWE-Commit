@@ -1769,24 +1769,20 @@ def update_all_agents_incremental():
 
             if already_mined_dates:
                 print(f"📅 Found {len(already_mined_dates)} already-mined dates")
-                print(f"   Skipping these dates and fetching only new data...")
-                # Fetch only commits from dates not yet mined
-                new_metadata = fetch_all_commits_metadata(
-                    identifier,
-                    agent_name,
-                    token,
-                    start_from_date=None,  # Use full 6-month range
-                    exclude_dates=already_mined_dates  # But exclude already-mined dates
-                )
+                print(f"   Re-mining ALL dates to ensure metadata is up-to-date (commit revert states may have changed)...")
             else:
                 print(f"📅 No existing data found. Mining everything from scratch...")
-                # Mine everything from scratch (full 6-month range)
-                new_metadata = fetch_all_commits_metadata(
-                    identifier,
-                    agent_name,
-                    token,
-                    start_from_date=None
-                )
+
+            # Always mine everything from scratch (full 6-month range)
+            # This ensures commit metadata is always fresh, even if day files exist
+            # (e.g., revert status may have changed since last mining)
+            new_metadata = fetch_all_commits_metadata(
+                identifier,
+                agent_name,
+                token,
+                start_from_date=None,  # Use full 6-month range
+                exclude_dates=None  # Don't exclude any dates - re-mine everything
+            )
 
             if new_metadata:
                 # Save new metadata to HuggingFace (organized by agent_identifier/YYYY.MM.DD.jsonl)
@@ -2161,61 +2157,29 @@ def submit_agent(identifier, agent_name, organization, description, website):
 
 def daily_update_task():
     """
-    Daily scheduled task (runs at 12:00 AM UTC) for smart commit updates.
+    Daily scheduled task (runs at 12:00 AM UTC) for regular commit mining.
 
     Strategy:
-    1. For each agent, refresh open commits from last 6 months
-    2. Skip commits that are already closed/resolved (no API calls)
-    3. Only fetch status for open commits to check if they've been closed/resolved
+    1. Re-mine ALL commits for all agents within LEADERBOARD_TIME_FRAME_DAYS
+    2. This ensures commit metadata is always up-to-date (e.g., revert status changes)
+    3. Even if day files already exist, they will be refreshed with current data
     4. Update leaderboard with refreshed data
 
-    This is much more efficient than fetching all commits every time.
+    This ensures that obsolete data (like outdated revert states) is always corrected.
     """
     print(f"\n{'='*80}")
-    print(f"🕛 Daily update started at {datetime.now(timezone.utc).isoformat()}")
+    print(f"🕛 Daily regular mining started at {datetime.now(timezone.utc).isoformat()}")
     print(f"{'='*80}")
 
     try:
-        token = get_github_token()
+        # Use the incremental update function which now re-mines everything
+        # (no longer skips existing day files within LEADERBOARD_TIME_FRAME_DAYS)
+        update_all_agents_incremental()
 
-        # Load all agents
-        agents = load_agents_from_hf()
-        if not agents:
-            print("No agents found")
-            return
-
-        print(f"📋 Processing {len(agents)} agents...")
-
-        total_checked = 0
-        total_updated = 0
-
-        # Refresh open commits for each agent (last 6 months)
-        for agent in agents:
-            identifier = agent.get('github_identifier')
-            agent_name = agent.get('agent_name', 'Unknown')
-
-            if not identifier:
-                continue
-
-            print(f"\n{'='*60}")
-            print(f"Processing: {agent_name} ({identifier})")
-            print(f"{'='*60}")
-
-            # Refresh open commits from last 6 months
-            checked, updated = refresh_commit_status_for_agent(identifier, token)
-            total_checked += checked
-            total_updated += updated
-
-        print(f"\n{'='*80}")
-        print(f"📊 Refresh Summary:")
-        print(f"   Total open commits checked: {total_checked}")
-        print(f"   Commits updated (newly reverted): {total_updated}")
-        print(f"{'='*80}")
-
-        print(f"\n✅ Daily update completed at {datetime.now(timezone.utc).isoformat()}")
+        print(f"\n✅ Daily regular mining completed at {datetime.now(timezone.utc).isoformat()}")
 
     except Exception as e:
-        print(f"✗ Daily update failed: {str(e)}")
+        print(f"✗ Daily regular mining failed: {str(e)}")
         import traceback
         traceback.print_exc()
 
@@ -2248,17 +2212,17 @@ else:
 
 initialize_data()
 
-# Start APScheduler for daily updates at 12:00 AM UTC
+# Start APScheduler for daily regular mining at 12:00 AM UTC
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
     daily_update_task,
     trigger=CronTrigger(hour=0, minute=0),  # 12:00 AM UTC daily
-    id='daily_commit_refresh',
-    name='Daily Commit Status Refresh',
+    id='daily_regular_mining',
+    name='Daily Regular Commit Mining',
     replace_existing=True
 )
 scheduler.start()
-print("✓ Scheduler started: Daily updates at 12:00 AM UTC")
+print("✓ Scheduler started: Daily regular mining at 12:00 AM UTC")
 
 # Create Gradio interface
 with gr.Blocks(title="SWE Agent Commit Leaderboard", theme=gr.themes.Soft()) as app:

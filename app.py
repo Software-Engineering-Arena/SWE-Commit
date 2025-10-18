@@ -48,6 +48,7 @@ DEBUG_COMMIT_METADATA_CACHE = defaultdict(list)
 
 AGENTS_REPO = "SWE-Arena/swe_agents"  # HuggingFace dataset for agent metadata
 COMMIT_METADATA_REPO = "SWE-Arena/commit_metadata"  # HuggingFace dataset for commit metadata
+LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for leaderboard (past 6 months)
 
 LEADERBOARD_COLUMNS = [
     ("Agent Name", "string"),
@@ -224,14 +225,16 @@ def validate_github_username(identifier):
         return False, f"Validation error: {str(e)}"
 
 
-def fetch_commits_with_time_partition(base_query, start_date, end_date, headers, commits_by_sha, debug_limit=None, depth=0):
+def fetch_commits_with_time_partition(base_query, start_date, end_date, headers, commits_by_sha, debug_limit=None, depth=0, check_reverts=True):
     """
     Fetch commits within a specific time range using time-based partitioning.
     Recursively splits the time range if hitting the 1000-result limit.
+    Optionally checks revert status immediately for each commit.
 
     Args:
         debug_limit: If set, stops fetching after this many NEW commits total across all partitions (for testing)
         depth: Current recursion depth (for tracking)
+        check_reverts: If True, checks revert status immediately for each commit (default: True)
 
     Returns the number of commits found in this time partition.
     """
@@ -284,9 +287,18 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
                 break
 
             # Add commits to global dict (keyed by SHA)
+            # Check revert status immediately for each new commit
             for commit in items:
                 commit_sha = commit.get('sha')
                 if commit_sha and commit_sha not in commits_by_sha:
+                    # Check revert status immediately if enabled
+                    if check_reverts:
+                        revert_status = check_single_commit_revert_status(commit_sha, headers)
+                        # Store revert status in commit object for later extraction
+                        commit['_revert_status'] = revert_status
+                        # Small delay to avoid rate limiting
+                        time.sleep(0.1)
+
                     commits_by_sha[commit_sha] = commit
                     total_in_partition += 1
 
@@ -320,7 +332,7 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
                             split_start = split_start + timedelta(days=1)
 
                         count = fetch_commits_with_time_partition(
-                            base_query, split_start, split_end, headers, commits_by_sha, debug_limit, depth + 1
+                            base_query, split_start, split_end, headers, commits_by_sha, debug_limit, depth + 1, check_reverts
                         )
                         total_from_splits += count
 
@@ -331,10 +343,10 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
 
                     # Recursively fetch both halves
                     count1 = fetch_commits_with_time_partition(
-                        base_query, start_date, mid_date, headers, commits_by_sha, debug_limit, depth + 1
+                        base_query, start_date, mid_date, headers, commits_by_sha, debug_limit, depth + 1, check_reverts
                     )
                     count2 = fetch_commits_with_time_partition(
-                        base_query, mid_date + timedelta(days=1), end_date, headers, commits_by_sha, debug_limit, depth + 1
+                        base_query, mid_date + timedelta(days=1), end_date, headers, commits_by_sha, debug_limit, depth + 1, check_reverts
                     )
 
                     return count1 + count2
@@ -571,7 +583,58 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
     return total_in_partition
 
 
-def extract_commit_metadata(commit):
+def check_single_commit_revert_status(sha, headers):
+    """
+    Check if a single commit has been reverted by searching GitHub for revert commits.
+
+    Args:
+        sha: Commit SHA to check
+        headers: HTTP headers for GitHub API
+
+    Returns:
+        Dictionary with 'is_reverted' (bool) and 'revert_at' (date string or None)
+    """
+    if not sha:
+        return {'is_reverted': False, 'revert_at': None}
+
+    # Search for commits that mention this SHA in a revert context
+    # Use abbreviated SHA (first 7 characters) which is commonly used in reverts
+    sha_abbr = sha[:7]
+    revert_query = f'"This reverts commit {sha_abbr}"'
+
+    try:
+        url = 'https://api.github.com/search/commits'
+        params = {
+            'q': revert_query,
+            'per_page': 1  # We only need to know if ANY revert exists
+        }
+
+        headers_with_accept = headers.copy() if headers else {}
+        headers_with_accept['Accept'] = 'application/vnd.github.cloak-preview+json'
+
+        response = request_with_backoff('GET', url, headers=headers_with_accept, params=params, max_retries=3)
+
+        if response and response.status_code == 200:
+            data = response.json()
+            total_count = data.get('total_count', 0)
+
+            if total_count > 0:
+                # This commit has been reverted
+                items = data.get('items', [])
+                if items:
+                    # Get the date of the first revert commit
+                    revert_commit = items[0]
+                    revert_at = revert_commit.get('commit', {}).get('author', {}).get('date')
+                    return {'is_reverted': True, 'revert_at': revert_at}
+
+        return {'is_reverted': False, 'revert_at': None}
+
+    except Exception as e:
+        print(f"   Warning: Could not check revert status for {sha_abbr}: {e}")
+        return {'is_reverted': False, 'revert_at': None}
+
+
+def extract_commit_metadata(commit, revert_status=None):
     """
     Extract minimal commit metadata for efficient storage.
     Only keeps essential fields: html_url, commit_at, revert_at, is_reverted.
@@ -582,22 +645,34 @@ def extract_commit_metadata(commit):
     - revert_at: Date when commit was reverted (if applicable)
 
     Stable Commit = commit that remains in repository history and has not been reverted
+
+    Args:
+        commit: Full commit object from GitHub API
+        revert_status: Optional dict with 'is_reverted' and 'revert_at' (if already checked)
     """
-    # Extract dates and revert status
+    # Extract dates
     commit_at = commit.get('commit', {}).get('author', {}).get('date')
+
+    # Use provided revert status or default to False
+    if revert_status is None:
+        revert_status = {'is_reverted': False, 'revert_at': None}
 
     return {
         'html_url': commit.get('html_url'),
         'commit_at': commit_at,
-        'revert_at': None,  # Will be populated if revert is detected
-        'is_reverted': False,  # Will be updated if revert is detected
+        'revert_at': revert_status.get('revert_at'),
+        'is_reverted': revert_status.get('is_reverted', False),
         'sha': commit.get('sha')  # Store SHA for revert detection
     }
 
 
 def detect_reverted_commits(metadata_list, headers, token):
     """
-    Detect which commits have been reverted by searching for revert commits.
+    DEPRECATED: This function is no longer used. Revert detection is now done inline
+    during commit retrieval in fetch_commits_with_time_partition().
+
+    Legacy function that detects which commits have been reverted by searching for revert commits.
+    This approach checked all commits in batch after retrieval, which was less efficient.
 
     Searches GitHub for commits containing "This reverts commit {sha}" in the message.
     Updates metadata_list in-place with revert information.
@@ -682,7 +757,7 @@ def detect_reverted_commits(metadata_list, headers, token):
     return metadata_list
 
 
-def fetch_all_commits_metadata(identifier, agent_name, token=None, start_from_date=None, year=None, exclude_dates=None):
+def fetch_all_commits_metadata(identifier, agent_name, token=None, start_from_date=None, exclude_dates=None):
     """
     Fetch commits associated with a GitHub user or bot for the past 6 months.
     Returns lightweight metadata instead of full commit objects.
@@ -691,15 +766,17 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, start_from_da
     It searches using the query pattern:
     - is:commit author:{identifier} (commits authored by the bot)
 
-    After fetching commits, it checks for reverts by searching for:
+    NEW: Revert status is checked IMMEDIATELY for each commit during retrieval by searching for:
     - "This reverts commit {sha}" in commit messages
+    This is more efficient than batch checking after all commits are fetched.
+
+    In DEBUG MODE: Revert checking is skipped to avoid excessive API calls.
 
     Args:
         identifier: GitHub username or bot identifier
         agent_name: Human-readable name of the agent for metadata purposes
         token: GitHub API token for authentication
         start_from_date: Only fetch commits created after this date (for incremental updates)
-        year: Year parameter (deprecated, retained for compatibility but not utilized)
         exclude_dates: Set of date objects to exclude from mining (dates that have already been processed)
 
     Returns:
@@ -746,14 +823,17 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, start_from_da
         pattern_start_time = time.time()
         initial_count = len(commits_by_sha)
 
-        # Fetch with time partitioning
+        # Fetch with time partitioning and inline revert checking
+        # In DEBUG MODE, skip revert checking to avoid excessive API calls
+        check_reverts = not DEBUG_MODE
         commits_found = fetch_commits_with_time_partition(
             query_pattern,
             start_date,
             end_date,
             headers,
             commits_by_sha,
-            debug_limit_per_pattern
+            debug_limit_per_pattern,
+            check_reverts=check_reverts
         )
 
         pattern_duration = time.time() - pattern_start_time
@@ -793,17 +873,26 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, start_from_da
 
     if DEBUG_MODE:
         print(f"\n✅ COMPLETE (DEBUG MODE): Found {len(all_commits)} unique commits for {identifier}")
-        print(f"   Note: In production mode, this would fetch ALL commits")
+        print(f"   Note: In production mode, this would fetch ALL commits and check revert status")
+        print(f"   🐛 DEBUG MODE: Skipped inline revert detection")
     else:
         print(f"\n✅ COMPLETE: Found {len(all_commits)} unique commits for {identifier}")
-    print(f"📦 Extracting minimal metadata and detecting reverts...")
+    print(f"📦 Extracting minimal metadata...")
 
     # Extract metadata for each commit
-    metadata_list = [extract_commit_metadata(commit) for commit in all_commits]
+    # Revert status was already checked inline during fetch (unless in DEBUG_MODE)
+    metadata_list = []
+    for commit in all_commits:
+        # Get inline revert status if it was checked
+        revert_status = commit.get('_revert_status')
+        metadata_list.append(extract_commit_metadata(commit, revert_status))
 
-    # Detect reverts by searching for "This reverts commit {sha}" patterns
-    print(f"🔍 Checking for reverted commits...")
-    metadata_list = detect_reverted_commits(metadata_list, headers, token)
+    # Count reverted commits
+    reverted_count = sum(1 for meta in metadata_list if meta.get('is_reverted', False))
+    if reverted_count > 0:
+        print(f"   ✓ Found {reverted_count} reverted commits")
+    else:
+        print(f"   ✓ No reverted commits found")
 
     # Calculate memory savings
     import sys
@@ -848,7 +937,7 @@ def calculate_commit_stats_from_metadata(metadata_list):
 def calculate_monthly_metrics_by_agent():
     """
     Calculate monthly metrics for all agents for visualization.
-    Loads data directly from SWE-Arena/commit_metadata dataset for the current year.
+    Loads data directly from SWE-Arena/commit_metadata dataset.
 
     Returns:
         dict: {
@@ -863,17 +952,14 @@ def calculate_monthly_metrics_by_agent():
             }
         }
     """
-    # Get current year for loading metadata
-    current_year = datetime.now().year
-
     # Load ALL agents from HuggingFace agents repo
     agents = load_agents_from_hf()
 
     # Create mapping from agent_identifier to agent_name
     identifier_to_name = {agent.get('github_identifier'): agent.get('agent_name') for agent in agents if agent.get('github_identifier')}
 
-    # Load all commit metadata for current year from commit_metadata dataset
-    all_metadata = load_commit_metadata_for_year(current_year)
+    # Load all commit metadata from commit_metadata dataset
+    all_metadata = load_commit_metadata()
 
     if not all_metadata:
         return {'agents': [], 'months': [], 'data': {}}
@@ -1054,52 +1140,78 @@ def save_commit_metadata_to_hf(metadata_list, agent_identifier):
         return False
 
 
-def load_commit_metadata_for_year(year):
+def load_commit_metadata():
     """
-    Load all commit metadata for a specific year from HuggingFace.
-    Scans all agent folders and loads daily files matching the year.
+    Load commit metadata from the last LEADERBOARD_TIME_FRAME_DAYS days.
     In debug mode, loads from in-memory cache if available.
 
     Structure: [agent_identifier]/YYYY.MM.DD.jsonl
 
     Returns:
         List of dictionaries with 'agent_identifier' added to each commit metadata.
+        Only includes commits within the last LEADERBOARD_TIME_FRAME_DAYS days.
     """
     # In debug mode, check in-memory cache first
     if DEBUG_MODE and DEBUG_COMMIT_METADATA_CACHE:
         all_metadata = []
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
+
         for agent_identifier, metadata_list in DEBUG_COMMIT_METADATA_CACHE.items():
             for commit_meta in metadata_list:
+                # Filter by time frame
+                commit_at = commit_meta.get('commit_at')
+                if commit_at:
+                    try:
+                        dt = datetime.fromisoformat(commit_at.replace('Z', '+00:00'))
+                        if dt < cutoff_date:
+                            continue  # Skip commits older than time frame
+                    except Exception:
+                        pass  # Keep commits with unparseable dates
+
                 commit_with_agent = commit_meta.copy()
                 commit_with_agent['agent_identifier'] = agent_identifier
                 all_metadata.append(commit_with_agent)
+
         if all_metadata:
-            print(f"🐛 DEBUG MODE: Loading commit metadata from in-memory cache ({len(all_metadata)} commits)")
+            print(f"🐛 DEBUG MODE: Loading commit metadata from in-memory cache ({len(all_metadata)} commits within last {LEADERBOARD_TIME_FRAME_DAYS} days)")
             return all_metadata
 
     try:
         api = HfApi()
         token = get_hf_token()
 
+        # Calculate cutoff date (LEADERBOARD_TIME_FRAME_DAYS ago)
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
+
         # List all files in the repository
         files = api.list_repo_files(repo_id=COMMIT_METADATA_REPO, repo_type="dataset")
 
-        # Filter for files matching the year pattern: [agent_identifier]/YYYY.MM.DD.jsonl
-        # Extract year from filename
-        year_str = str(year)
-        year_files = []
+        # Filter for files matching the pattern: [agent_identifier]/YYYY.MM.DD.jsonl
+        # Only consider files within the time frame
+        relevant_files = []
         for f in files:
             if f.endswith('.jsonl'):
                 parts = f.split('/')
                 if len(parts) == 2:  # [agent_identifier]/YYYY.MM.DD.jsonl
                     filename = parts[1]
-                    if filename.startswith(year_str + '.'):
-                        year_files.append(f)
+                    try:
+                        # Extract date from filename: YYYY.MM.DD.jsonl
+                        date_part = filename.replace('.jsonl', '')
+                        date_components = date_part.split('.')
+                        if len(date_components) == 3:
+                            file_year, file_month, file_day = map(int, date_components)
+                            file_date = datetime(file_year, file_month, file_day, tzinfo=timezone.utc)
 
-        print(f"📥 Loading commit metadata for {year} ({len(year_files)} daily files across all agents)...")
+                            # Only include files within the time frame
+                            if file_date >= cutoff_date:
+                                relevant_files.append(f)
+                    except Exception:
+                        continue  # Skip files with invalid date format
+
+        print(f"📥 Loading commit metadata from last {LEADERBOARD_TIME_FRAME_DAYS} days ({len(relevant_files)} daily files across all agents)...")
 
         all_metadata = []
-        for filename in year_files:
+        for filename in relevant_files:
             try:
                 # Extract agent_identifier from path (first part)
                 # Format: agent_identifier/YYYY.MM.DD.jsonl
@@ -1118,20 +1230,30 @@ def load_commit_metadata_for_year(year):
                 )
                 day_metadata = load_jsonl(file_path)
 
-                # Add agent_identifier to each commit metadata for processing
+                # Add agent_identifier to each commit metadata and filter by commit_at
                 for commit_meta in day_metadata:
-                    commit_meta['agent_identifier'] = agent_identifier
+                    # Double-check individual commit dates (in case file contains older data)
+                    commit_at = commit_meta.get('commit_at')
+                    if commit_at:
+                        try:
+                            dt = datetime.fromisoformat(commit_at.replace('Z', '+00:00'))
+                            if dt < cutoff_date:
+                                continue  # Skip commits older than time frame
+                        except Exception:
+                            pass  # Keep commits with unparseable dates
 
-                all_metadata.extend(day_metadata)
+                    commit_meta['agent_identifier'] = agent_identifier
+                    all_metadata.append(commit_meta)
+
                 print(f"   ✓ Loaded {len(day_metadata)} commits from {filename}")
             except Exception as e:
                 print(f"   Warning: Could not load {filename}: {str(e)}")
 
-        print(f"✓ Loaded {len(all_metadata)} total commits for {year}")
+        print(f"✓ Loaded {len(all_metadata)} total commits within last {LEADERBOARD_TIME_FRAME_DAYS} days")
         return all_metadata
 
     except Exception as e:
-        print(f"✗ Error loading commit metadata for {year}: {str(e)}")
+        print(f"✗ Error loading commit metadata: {str(e)}")
         return []
 
 
@@ -1619,7 +1741,6 @@ def update_all_agents_incremental():
     Returns dictionary of all agent data with current stats.
     """
     token = get_github_token()
-    current_year = datetime.now().year
 
     # Load agent metadata from HuggingFace
     agents = load_agents_from_hf()
@@ -1674,12 +1795,12 @@ def update_all_agents_incremental():
             else:
                 print(f"   No new commits to save")
 
-            # Load ALL metadata for current year to calculate stats (aggregates entire last 6 months)
+            # Load ALL metadata to calculate stats (aggregates entire last 6 months)
             print(f"📊 Calculating statistics from ALL stored metadata (last 6 months)...")
-            all_year_metadata = load_commit_metadata_for_year(current_year)
+            all_metadata = load_commit_metadata()
 
             # Filter for this specific agent
-            agent_metadata = [commit for commit in all_year_metadata if commit.get("agent_identifier") == identifier]
+            agent_metadata = [commit for commit in all_metadata if commit.get("agent_identifier") == identifier]
 
             # Calculate stats from metadata
             stats = calculate_commit_stats_from_metadata(agent_metadata)
@@ -1711,7 +1832,6 @@ def construct_leaderboard_from_metadata():
     Returns dictionary of agent stats.
     """
     print("📊 Constructing leaderboard from commit metadata...")
-    current_year = datetime.now().year
 
     # Load agents
     agents = load_agents_from_hf()
@@ -1719,8 +1839,8 @@ def construct_leaderboard_from_metadata():
         print("No agents found")
         return {}
 
-    # Load all commit metadata for current year
-    all_metadata = load_commit_metadata_for_year(current_year)
+    # Load all commit metadata
+    all_metadata = load_commit_metadata()
 
     cache_dict = {}
 

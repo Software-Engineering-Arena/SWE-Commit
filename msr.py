@@ -465,12 +465,8 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, dates_to_skip
     headers = {'Authorization': f'token {token}'} if token else {}
 
     # Define query patterns
-    stripped_id = identifier.replace('[bot]', '')
     query_patterns = []
-
     query_patterns.append(f'is:commit author:{identifier}')
-    if stripped_id != identifier:
-        query_patterns.append(f'is:commit author:{stripped_id}')
 
     commits_by_sha = {}
 

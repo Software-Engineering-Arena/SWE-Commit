@@ -776,11 +776,8 @@ def fetch_daily_commits_metadata(identifier, agent_name, token=None, target_date
         end_date = start_date + timedelta(days=1)
 
     # Define query patterns
-    stripped_id = identifier.replace('[bot]', '')
     query_patterns = []
     query_patterns.append(f'is:commit author:{identifier}')
-    if stripped_id != identifier:
-        query_patterns.append(f'is:commit author:{stripped_id}')
 
     commits_by_sha = {}
 
@@ -985,7 +982,7 @@ def update_revert_status_for_recent_commits(token=None):
 
     print(f"\n✓ Updated revert status for {total_updated} commits across {len(commits_by_agent)} agents")
     return total_updated
-    
+
 
 def calculate_commit_stats_from_metadata(metadata_list):
     """

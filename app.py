@@ -889,6 +889,192 @@ def detect_reverted_commits(metadata_list, headers, token):
     return metadata_list
 
 
+def fetch_daily_commits_metadata(identifier, agent_name, token=None, target_date=None, check_reverts=False):
+    """
+    Fetch commits for a specific day (12am to 12am UTC).
+    Used for daily incremental updates.
+
+    Args:
+        identifier: GitHub username or bot identifier
+        agent_name: Human-readable name of the agent for metadata purposes
+        token: GitHub API token for authentication
+        target_date: Date to fetch commits for (defaults to yesterday)
+        check_reverts: Whether to check revert status (default: False for new commits)
+
+    Returns:
+        List of dictionaries containing minimal commit metadata
+    """
+    headers = {'Authorization': f'token {token}'} if token else {}
+
+    # Calculate target date range (12am yesterday to 12am today)
+    if target_date is None:
+        # Default: yesterday (12am yesterday to 12am today)
+        now = datetime.now(timezone.utc)
+        end_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_date = end_date - timedelta(days=1)
+    else:
+        # Use specified date
+        start_date = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+        end_date = start_date + timedelta(days=1)
+
+    # Define query patterns
+    stripped_id = identifier.replace('[bot]', '')
+    query_patterns = []
+    query_patterns.append(f'is:commit author:{identifier}')
+    if stripped_id != identifier:
+        query_patterns.append(f'is:commit author:{stripped_id}')
+
+    commits_by_sha = {}
+
+    for query_pattern in query_patterns:
+        print(f"\n🔍 Fetching daily commits: {query_pattern}")
+        print(f"   Date range: {start_date.strftime('%Y-%m-%d %H:%M')} to {end_date.strftime('%Y-%m-%d %H:%M')}")
+
+        # Fetch commits for this specific day
+        fetch_commits_with_time_partition(
+            query_pattern,
+            start_date,
+            end_date,
+            headers,
+            commits_by_sha,
+            debug_limit_per_pattern=None,
+            check_reverts=False
+        )
+
+    all_commits = list(commits_by_sha.values())
+
+    # Optionally check revert status
+    if check_reverts and all_commits and not DEBUG_MODE:
+        print(f"\n🔄 Checking revert status for {len(all_commits)} commits...")
+        revert_results = batch_check_reverts_for_commits(
+            commits_by_sha,
+            headers,
+            start_date=start_date,
+            end_date=end_date
+        )
+        for sha, commit in commits_by_sha.items():
+            commit['_revert_status'] = revert_results.get(sha)
+
+    # Extract metadata
+    metadata_list = []
+    for commit in all_commits:
+        revert_status = commit.get('_revert_status')
+        metadata_list.append(extract_commit_metadata(commit, revert_status))
+
+    print(f"✓ Found {len(metadata_list)} commits for {start_date.strftime('%Y-%m-%d')}")
+    return metadata_list
+
+
+def update_revert_status_for_recent_commits(token=None):
+    """
+    Update revert status for all commits within LEADERBOARD_TIME_FRAME_DAYS - 1.
+    This is used during daily updates to refresh revert status for recent commits.
+
+    Strategy:
+    1. Load all existing commits within the leaderboard timeframe
+    2. Group by agent and check revert status in batch
+    3. Save updated metadata back to HuggingFace
+
+    Args:
+        token: GitHub API token for authentication
+
+    Returns:
+        Number of commits processed
+    """
+    headers = {'Authorization': f'token {token}'} if token else {}
+
+    print(f"\n{'='*80}")
+    print(f"🔄 Updating revert status for recent commits (last {LEADERBOARD_TIME_FRAME_DAYS - 1} days)")
+    print(f"{'='*80}")
+
+    # Load all recent commits
+    all_metadata = load_commit_metadata()
+
+    if not all_metadata:
+        print("   No commits found to update")
+        return 0
+
+    # Calculate date range for revert checking (last LEADERBOARD_TIME_FRAME_DAYS - 1 days)
+    current_time = datetime.now(timezone.utc)
+    cutoff_days = LEADERBOARD_TIME_FRAME_DAYS - 1
+    start_date = current_time - timedelta(days=cutoff_days)
+    end_date = current_time
+
+    # Filter commits within the update timeframe
+    recent_commits = []
+    for commit_meta in all_metadata:
+        commit_at = commit_meta.get('commit_at')
+        if commit_at:
+            try:
+                dt = datetime.fromisoformat(commit_at.replace('Z', '+00:00'))
+                if dt >= start_date:
+                    recent_commits.append(commit_meta)
+            except Exception:
+                pass
+
+    print(f"   Found {len(recent_commits)} commits to update revert status")
+
+    if not recent_commits:
+        return 0
+
+    # Group commits by agent
+    commits_by_agent = {}
+    for commit_meta in recent_commits:
+        agent_id = commit_meta.get('agent_identifier')
+        if agent_id:
+            if agent_id not in commits_by_agent:
+                commits_by_agent[agent_id] = {}
+            sha = commit_meta.get('sha')
+            if sha:
+                # Store minimal commit object for revert checking
+                commits_by_agent[agent_id][sha] = {
+                    'sha': sha,
+                    'html_url': commit_meta.get('html_url'),
+                    'commit': {
+                        'author': {
+                            'date': commit_meta.get('commit_at')
+                        }
+                    }
+                }
+
+    # Update revert status for each agent's commits
+    total_updated = 0
+    for agent_id, commits_by_sha in commits_by_agent.items():
+        print(f"\n   Processing {agent_id}: {len(commits_by_sha)} commits")
+
+        # Batch check revert status
+        if not DEBUG_MODE:
+            revert_results = batch_check_reverts_for_commits(
+                commits_by_sha,
+                headers,
+                start_date=start_date,
+                end_date=end_date
+            )
+
+            # Update metadata with new revert status
+            updated_metadata = []
+            for commit_meta in recent_commits:
+                if commit_meta.get('agent_identifier') == agent_id:
+                    sha = commit_meta.get('sha')
+                    if sha and sha in revert_results:
+                        # Update revert status
+                        revert_status = revert_results[sha]
+                        commit_meta['is_reverted'] = revert_status.get('is_reverted', False)
+                        commit_meta['revert_at'] = revert_status.get('revert_at')
+                    updated_metadata.append(commit_meta)
+
+            # Save updated metadata back to HuggingFace
+            if updated_metadata:
+                print(f"   💾 Saving {len(updated_metadata)} updated commits for {agent_id}")
+                save_commit_metadata_to_hf(updated_metadata, agent_id)
+                total_updated += len(updated_metadata)
+        else:
+            print(f"   🐛 DEBUG MODE: Skipping revert status update")
+
+    print(f"\n✓ Updated revert status for {total_updated} commits")
+    return total_updated
+
+
 def fetch_all_commits_metadata(identifier, agent_name, token=None, start_from_date=None, exclude_dates=None):
     """
     Fetch commits associated with a GitHub user or bot for the past 6 months.
@@ -1862,17 +2048,25 @@ def save_agent_to_hf(data):
 # DATA MANAGEMENT
 # =============================================================================
 
-def update_all_agents_incremental():
+def update_all_agents_incremental(daily_mode=False):
     """
     Memory-efficient incremental update of commit statistics for all agents.
 
-    Strategy:
+    Strategy (when daily_mode=False - full initial mining):
     1. For each agent, load existing data from SWE-Arena/commit_metadata
     2. Identify already-mined dates (based on filename: YYYY.MM.DD.jsonl)
     3. Only fetch commits from dates that haven't been mined yet (within last 6 months)
     4. If no data exists at all, mine everything from scratch
     5. Store minimal metadata (not full commit objects) to avoid storage limits
     6. Construct leaderboard from ALL stored metadata (last 6 months)
+
+    Strategy (when daily_mode=True - daily incremental update):
+    1. Fetch ONLY yesterday's new commits (12am yesterday to 12am today)
+    2. Update revert status for ALL commits within LEADERBOARD_TIME_FRAME_DAYS - 1
+    3. Calculate updated statistics from all stored metadata
+
+    Args:
+        daily_mode: If True, only fetch yesterday's commits and update revert status
 
     Returns dictionary of all agent data with current stats.
     """
@@ -1885,6 +2079,10 @@ def update_all_agents_incremental():
         return {}
 
     cache_dict = {}
+
+    # For daily mode, first update revert status for all recent commits
+    if daily_mode:
+        update_revert_status_for_recent_commits(token)
 
     # Update each agent
     for agent in agents:
@@ -1900,32 +2098,51 @@ def update_all_agents_incremental():
             print(f"Processing: {agent_name} ({identifier})")
             print(f"{'='*80}")
 
-            # Get already-mined dates for this agent (last 6 months)
-            already_mined_dates = get_already_mined_dates(identifier, n_months=6)
+            if daily_mode:
+                # DAILY MODE: Only fetch yesterday's commits
+                print(f"📅 Daily mode: Fetching yesterday's commits only")
 
-            if already_mined_dates:
-                print(f"📅 Found {len(already_mined_dates)} already-mined dates")
-                print(f"   Re-mining ALL dates to ensure metadata is up-to-date (commit revert states may have changed)...")
+                # Fetch yesterday's commits (no revert checking needed for new commits)
+                new_metadata = fetch_daily_commits_metadata(
+                    identifier,
+                    agent_name,
+                    token,
+                    target_date=None,  # Yesterday by default
+                    check_reverts=False  # Revert checking already done in bulk above
+                )
+
+                if new_metadata:
+                    print(f"💾 Saving {len(new_metadata)} new commit records...")
+                    save_commit_metadata_to_hf(new_metadata, identifier)
+                else:
+                    print(f"   No new commits for yesterday")
+
             else:
-                print(f"📅 No existing data found. Mining everything from scratch...")
+                # FULL MINING MODE: Mine all unmined dates
+                # Get already-mined dates for this agent (last 6 months)
+                already_mined_dates = get_already_mined_dates(identifier, n_months=6)
 
-            # Always mine everything from scratch (full 6-month range)
-            # This ensures commit metadata is always fresh, even if day files exist
-            # (e.g., revert status may have changed since last mining)
-            new_metadata = fetch_all_commits_metadata(
-                identifier,
-                agent_name,
-                token,
-                start_from_date=None,  # Use full 6-month range
-                exclude_dates=None  # Don't exclude any dates - re-mine everything
-            )
+                if already_mined_dates:
+                    print(f"📅 Found {len(already_mined_dates)} already-mined dates")
+                    print(f"   Only mining dates that haven't been processed yet...")
+                else:
+                    print(f"📅 No existing data found. Mining everything from scratch...")
 
-            if new_metadata:
-                # Save new metadata to HuggingFace (organized by agent_identifier/YYYY.MM.DD.jsonl)
-                print(f"💾 Saving {len(new_metadata)} new commit records...")
-                save_commit_metadata_to_hf(new_metadata, identifier)
-            else:
-                print(f"   No new commits to save")
+                # Fetch commits, excluding already-mined dates
+                new_metadata = fetch_all_commits_metadata(
+                    identifier,
+                    agent_name,
+                    token,
+                    start_from_date=None,  # Use full 6-month range
+                    exclude_dates=already_mined_dates  # Exclude already-mined dates
+                )
+
+                if new_metadata:
+                    # Save new metadata to HuggingFace (organized by agent_identifier/YYYY.MM.DD.jsonl)
+                    print(f"💾 Saving {len(new_metadata)} new commit records...")
+                    save_commit_metadata_to_hf(new_metadata, identifier)
+                else:
+                    print(f"   No new commits to save")
 
             # Load ALL metadata to calculate stats (aggregates entire last 6 months)
             print(f"📊 Calculating statistics from ALL stored metadata (last 6 months)...")
@@ -2293,29 +2510,32 @@ def submit_agent(identifier, agent_name, organization, description, website):
 
 def daily_update_task():
     """
-    Daily scheduled task (runs at 12:00 AM UTC) for regular commit mining.
+    Daily scheduled task (runs at 12:00 AM UTC) for incremental commit mining.
 
-    Strategy:
-    1. Re-mine ALL commits for all agents within LEADERBOARD_TIME_FRAME_DAYS
-    2. This ensures commit metadata is always up-to-date (e.g., revert status changes)
-    3. Even if day files already exist, they will be refreshed with current data
+    Optimized Strategy:
+    1. Fetch ONLY yesterday's new commits (12am yesterday to 12am today)
+    2. Update revert status for ALL commits within LEADERBOARD_TIME_FRAME_DAYS - 1
+       This ensures revert status stays current without re-fetching all commits
+    3. Calculate updated statistics from all stored metadata
     4. Update leaderboard with refreshed data
 
-    This ensures that obsolete data (like outdated revert states) is always corrected.
+    This approach is much more efficient than re-mining all commits every day:
+    - New commits: fetched once per day
+    - Revert status: updated in batch for recent commits only
+    - Historical commits: not re-fetched, saving API calls and time
     """
     print(f"\n{'='*80}")
-    print(f"🕛 Daily regular mining started at {datetime.now(timezone.utc).isoformat()}")
+    print(f"🕛 Daily incremental update started at {datetime.now(timezone.utc).isoformat()}")
     print(f"{'='*80}")
 
     try:
-        # Use the incremental update function which now re-mines everything
-        # (no longer skips existing day files within LEADERBOARD_TIME_FRAME_DAYS)
-        update_all_agents_incremental()
+        # Use daily mode: fetch yesterday's commits + update revert status
+        update_all_agents_incremental(daily_mode=True)
 
-        print(f"\n✅ Daily regular mining completed at {datetime.now(timezone.utc).isoformat()}")
+        print(f"\n✅ Daily incremental update completed at {datetime.now(timezone.utc).isoformat()}")
 
     except Exception as e:
-        print(f"✗ Daily regular mining failed: {str(e)}")
+        print(f"✗ Daily incremental update failed: {str(e)}")
         import traceback
         traceback.print_exc()
 
@@ -2353,12 +2573,12 @@ scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
     daily_update_task,
     trigger=CronTrigger(hour=0, minute=0),  # 12:00 AM UTC daily
-    id='daily_regular_mining',
-    name='Daily Regular Commit Mining',
+    id='daily_incremental_update',
+    name='Daily Incremental Commit Update',
     replace_existing=True
 )
 scheduler.start()
-print("✓ Scheduler started: Daily regular mining at 12:00 AM UTC")
+print("✓ Scheduler started: Daily incremental update at 12:00 AM UTC")
 
 # Create Gradio interface
 with gr.Blocks(title="SWE Agent Commit Leaderboard", theme=gr.themes.Soft()) as app:

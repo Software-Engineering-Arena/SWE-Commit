@@ -508,13 +508,13 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, dates_to_skip
 
     commits_by_sha = {}
 
-    # Define time range: past LEADERBOARD_TIME_FRAME_DAYS
+    # Define time range: past LEADERBOARD_TIME_FRAME_DAYS, excluding today (12am onwards)
     current_time = datetime.now(timezone.utc)
-    start_date = current_time - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
-    end_date = current_time
+    end_date = current_time.replace(hour=0, minute=0, second=0, microsecond=0)  # 12am today
+    start_date = end_date - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
 
     print(f"\n🔍 Searching with query: {query_pattern}")
-    print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} (excluding today)")
     if dates_to_skip:
         print(f"   Skipping {len(dates_to_skip)} existing date(s)")
 

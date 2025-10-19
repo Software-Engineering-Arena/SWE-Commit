@@ -144,52 +144,6 @@ def request_with_backoff(method, url, *, headers=None, params=None, json_body=No
     return None
 
 
-def check_single_commit_revert_status(sha, headers):
-    """
-    DEPRECATED: Use batch_check_reverts_for_commits() instead for better efficiency.
-
-    Check if a single commit has been reverted by searching GitHub for revert commits.
-
-    Returns:
-        Dictionary with 'is_reverted' (bool) and 'revert_at' (date string or None)
-    """
-    if not sha:
-        return {'is_reverted': False, 'revert_at': None}
-
-    # Search for commits that mention this SHA in a revert context
-    sha_abbr = sha[:7]
-    revert_query = f'"This reverts commit {sha_abbr}"'
-
-    try:
-        url = 'https://api.github.com/search/commits'
-        params = {
-            'q': revert_query,
-            'per_page': 1
-        }
-
-        headers_with_accept = headers.copy() if headers else {}
-        headers_with_accept['Accept'] = 'application/vnd.github.cloak-preview+json'
-
-        response = request_with_backoff('GET', url, headers=headers_with_accept, params=params, max_retries=3)
-
-        if response and response.status_code == 200:
-            data = response.json()
-            total_count = data.get('total_count', 0)
-
-            if total_count > 0:
-                items = data.get('items', [])
-                if items:
-                    revert_commit = items[0]
-                    revert_at = revert_commit.get('commit', {}).get('author', {}).get('date')
-                    return {'is_reverted': True, 'revert_at': revert_at}
-
-        return {'is_reverted': False, 'revert_at': None}
-
-    except Exception as e:
-        print(f"   Warning: Could not check revert status for {sha_abbr}: {e}")
-        return {'is_reverted': False, 'revert_at': None}
-
-
 def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, end_date=None):
     """
     Check revert status for commits using SCOPED batch approach (highly efficient).
@@ -235,10 +189,10 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
 
         # Build query for this batch of SHAs
         # Search for: "This reverts commit <sha1>" OR "This reverts commit <sha2>" ...
+        # GitHub uses full SHA in revert commit messages
         sha_queries = []
         for sha in batch_shas:
-            sha_abbr = sha[:7]
-            sha_queries.append(f'"This reverts commit {sha_abbr}"')
+            sha_queries.append(f'"This reverts commit {sha}"')
 
         # Combine with OR (GitHub search supports this)
         revert_query = ' OR '.join(sha_queries)
@@ -306,14 +260,13 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
     # Build results for our commits
     results = {}
     for sha in commits_by_sha:
-        sha_abbr = sha[:7].lower()
         sha_lower = sha.lower()
 
-        # Check both full SHA and abbreviated SHA
-        if sha_lower in revert_map or sha_abbr in revert_map:
+        # Check full SHA (primary)
+        if sha_lower in revert_map:
             results[sha] = {
                 'is_reverted': True,
-                'revert_at': revert_map.get(sha_lower) or revert_map.get(sha_abbr)
+                'revert_at': revert_map.get(sha_lower)
             }
         else:
             results[sha] = {
@@ -327,16 +280,28 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
     return results
 
 
-def fetch_commits_with_time_partition(base_query, start_date, end_date, headers, commits_by_sha, depth=0, check_reverts=False):
+def fetch_commits_with_time_partition(base_query, start_date, end_date, headers, commits_by_sha, depth=0, dates_to_skip=None):
     """
     Fetch commits within a specific time range using time-based partitioning.
     Recursively splits the time range if hitting the 1000-result limit.
 
     Args:
-        check_reverts: DEPRECATED - revert checking is now done in batch after all commits are fetched
+        dates_to_skip: Set of (year, month, day) tuples to skip during mining
 
     Returns the number of commits found in this time partition.
     """
+    if dates_to_skip is None:
+        dates_to_skip = set()
+
+    # Check if this entire date range should be skipped
+    # If start and end are the same day and it's in dates_to_skip, skip it
+    if start_date.date() == end_date.date():
+        date_key = (start_date.year, start_date.month, start_date.day)
+        if date_key in dates_to_skip:
+            indent = "  " + "  " * depth
+            print(f"{indent}⏭️  Skipping {start_date.strftime('%Y-%m-%d')} (already exists)")
+            return 0
+
     # Format dates for GitHub search (YYYY-MM-DD)
     start_str = start_date.strftime('%Y-%m-%d')
     end_str = end_date.strftime('%Y-%m-%d')
@@ -415,7 +380,7 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
                             split_start = split_start + timedelta(days=1)
 
                         count = fetch_commits_with_time_partition(
-                            base_query, split_start, split_end, headers, commits_by_sha, depth + 1, check_reverts
+                            base_query, split_start, split_end, headers, commits_by_sha, depth + 1, dates_to_skip
                         )
                         total_from_splits += count
 
@@ -425,10 +390,10 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
                     mid_date = start_date + time_diff / 2
 
                     count1 = fetch_commits_with_time_partition(
-                        base_query, start_date, mid_date, headers, commits_by_sha, depth + 1, check_reverts
+                        base_query, start_date, mid_date, headers, commits_by_sha, depth + 1, dates_to_skip
                     )
                     count2 = fetch_commits_with_time_partition(
-                        base_query, mid_date + timedelta(days=1), end_date, headers, commits_by_sha, depth + 1, check_reverts
+                        base_query, mid_date + timedelta(days=1), end_date, headers, commits_by_sha, depth + 1, dates_to_skip
                     )
 
                     return count1 + count2
@@ -469,7 +434,7 @@ def extract_commit_metadata(commit, revert_status=None):
     }
 
 
-def fetch_all_commits_metadata(identifier, agent_name, token=None):
+def fetch_all_commits_metadata(identifier, agent_name, token=None, dates_to_skip=None):
     """
     Fetch commits associated with a GitHub user or bot for the past LEADERBOARD_TIME_FRAME_DAYS.
     Returns lightweight metadata instead of full commit objects.
@@ -482,10 +447,14 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None):
         identifier: GitHub username or bot identifier
         agent_name: Human-readable name of the agent for metadata purposes
         token: GitHub API token for authentication
+        dates_to_skip: Set of (year, month, day) tuples to skip during mining
 
     Returns:
         List of dictionaries containing minimal commit metadata with revert status
     """
+    if dates_to_skip is None:
+        dates_to_skip = set()
+
     headers = {'Authorization': f'token {token}'} if token else {}
 
     # Define query patterns
@@ -506,6 +475,8 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None):
     for query_pattern in query_patterns:
         print(f"\n🔍 Searching with query: {query_pattern}")
         print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+        if dates_to_skip:
+            print(f"   Skipping {len(dates_to_skip)} existing date(s)")
 
         pattern_start_time = time.time()
         initial_count = len(commits_by_sha)
@@ -517,7 +488,7 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None):
             end_date,
             headers,
             commits_by_sha,
-            check_reverts=False  # Never check inline, we'll do batch checking after
+            dates_to_skip=dates_to_skip
         )
 
         pattern_duration = time.time() - pattern_start_time
@@ -613,6 +584,119 @@ def upload_with_retry(api, path_or_fileobj, path_in_repo, repo_id, repo_type, to
                 raise
 
 
+def update_revert_status_for_existing_dates(agent_identifier, existing_dates, token=None):
+    """
+    Update only the revert status for commits on existing dates.
+    This is much more efficient than re-mining all commit data.
+
+    Args:
+        agent_identifier: GitHub identifier of the agent
+        existing_dates: Set of (year, month, day) tuples that already have data
+        token: GitHub API token for authentication
+
+    Returns:
+        Number of files updated
+    """
+    if not existing_dates:
+        return 0
+
+    print(f"\n🔄 Updating revert status for {len(existing_dates)} existing date(s)...")
+
+    headers = {'Authorization': f'token {token}'} if token else {}
+    hf_token = get_hf_token()
+    if not hf_token:
+        raise Exception("No HuggingFace token found")
+
+    api = HfApi()
+    updated_count = 0
+
+    # Define time range for revert checking
+    current_time = datetime.now(timezone.utc)
+    start_date = current_time - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
+    end_date = current_time
+
+    for (year, month, day) in sorted(existing_dates):
+        filename = f"{agent_identifier}/{year}.{month:02d}.{day:02d}.jsonl"
+        local_filename = f"{year}.{month:02d}.{day:02d}.jsonl"
+
+        try:
+            # Download existing file
+            print(f"   📥 Downloading {filename}...")
+            file_path = hf_hub_download(
+                repo_id=COMMIT_METADATA_REPO,
+                filename=filename,
+                repo_type="dataset",
+                token=hf_token
+            )
+            existing_metadata = load_jsonl(file_path)
+
+            if not existing_metadata:
+                print(f"   ⚠️  No commits found in {filename}, skipping")
+                continue
+
+            print(f"   🔍 Checking revert status for {len(existing_metadata)} commits...")
+
+            # Build commits_by_sha dict for batch checking
+            commits_by_sha = {}
+            for meta in existing_metadata:
+                sha = meta.get('sha')
+                if sha:
+                    # Create a minimal commit object for revert checking
+                    commits_by_sha[sha] = {
+                        'sha': sha,
+                        'commit': {
+                            'author': {
+                                'date': meta.get('commit_at')
+                            }
+                        }
+                    }
+
+            # Batch check revert status
+            revert_results = batch_check_reverts_for_commits(
+                commits_by_sha,
+                headers,
+                start_date=start_date,
+                end_date=end_date
+            )
+
+            # Update metadata with new revert status
+            updated_metadata = []
+            for meta in existing_metadata:
+                sha = meta.get('sha')
+                if sha and sha in revert_results:
+                    revert_status = revert_results[sha]
+                    meta['is_reverted'] = revert_status.get('is_reverted', False)
+                    meta['revert_at'] = revert_status.get('revert_at')
+                updated_metadata.append(meta)
+
+            # Save locally
+            save_jsonl(local_filename, updated_metadata)
+
+            # Upload to HuggingFace
+            try:
+                upload_with_retry(
+                    api=api,
+                    path_or_fileobj=local_filename,
+                    path_in_repo=filename,
+                    repo_id=COMMIT_METADATA_REPO,
+                    repo_type="dataset",
+                    token=hf_token
+                )
+                print(f"   ✓ Updated revert status in {filename}")
+                updated_count += 1
+            finally:
+                # Clean up local file
+                if os.path.exists(local_filename):
+                    os.remove(local_filename)
+
+        except Exception as e:
+            print(f"   ✗ Error updating {filename}: {str(e)}")
+            continue
+
+    print(f"✅ Updated revert status in {updated_count}/{len(existing_dates)} file(s)")
+    return updated_count
+
+
 def save_commit_metadata_to_hf(metadata_list, agent_identifier):
     """
     Save commit metadata to HuggingFace dataset, organized by [agent_identifier]/YYYY.MM.DD.jsonl.
@@ -687,6 +771,43 @@ def save_commit_metadata_to_hf(metadata_list, agent_identifier):
         return False
 
 
+def get_existing_date_agent_combinations(agent_identifier):
+    """
+    Fetch existing (year, month, day) dates for a specific agent from HuggingFace.
+    Returns a set of (year, month, day) tuples that already have data.
+    """
+    try:
+        api = HfApi()
+
+        # List all files in the repository
+        files = api.list_repo_files(repo_id=COMMIT_METADATA_REPO, repo_type="dataset")
+
+        # Filter for files in this agent's folder with .jsonl extension
+        # Expected format: agent_identifier/YYYY.MM.DD.jsonl
+        existing_dates = set()
+        prefix = f"{agent_identifier}/"
+
+        for file in files:
+            if file.startswith(prefix) and file.endswith('.jsonl'):
+                # Extract date from filename: YYYY.MM.DD.jsonl
+                filename = file[len(prefix):]  # Remove prefix
+                try:
+                    date_part = filename.replace('.jsonl', '')  # Remove extension
+                    parts = date_part.split('.')
+                    if len(parts) == 3:
+                        year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+                        existing_dates.add((year, month, day))
+                except Exception as e:
+                    print(f"   Warning: Could not parse date from filename {file}: {e}")
+                    continue
+
+        return existing_dates
+
+    except Exception as e:
+        print(f"   Warning: Could not fetch existing dates for {agent_identifier}: {e}")
+        return set()
+
+
 def load_agents_from_hf():
     """Load all agent metadata JSON files from HuggingFace dataset."""
     try:
@@ -733,6 +854,11 @@ def load_agents_from_hf():
 def mine_all_agents():
     """
     Mine commit metadata for all agents within LEADERBOARD_TIME_FRAME_DAYS and save to HuggingFace.
+
+    SMART MINING STRATEGY:
+    1. Check which (date, agent) combinations already exist in COMMIT_METADATA_REPO
+    2. For existing dates: Only update revert status (much faster)
+    3. For missing dates: Mine commit metadata from scratch
     """
     token = get_github_token()
 
@@ -743,7 +869,7 @@ def mine_all_agents():
         return
 
     print(f"\n{'='*80}")
-    print(f"Starting commit metadata mining for {len(agents)} agents")
+    print(f"Starting SMART commit metadata mining for {len(agents)} agents")
     print(f"Time frame: Last {LEADERBOARD_TIME_FRAME_DAYS} days")
     print(f"{'='*80}\n")
 
@@ -761,15 +887,37 @@ def mine_all_agents():
             print(f"Processing: {agent_name} ({identifier})")
             print(f"{'='*80}")
 
-            # Fetch commit metadata
-            metadata = fetch_all_commits_metadata(identifier, agent_name, token)
+            # Step 1: Check which dates already exist for this agent
+            print(f"\n📋 Checking existing data for {identifier}...")
+            existing_dates = get_existing_date_agent_combinations(identifier)
+
+            if existing_dates:
+                print(f"   Found {len(existing_dates)} existing date(s)")
+
+                # Step 2: Update revert status for existing dates
+                print(f"\n🔄 Strategy: Update revert status for existing dates")
+                update_revert_status_for_existing_dates(identifier, existing_dates, token)
+            else:
+                print(f"   No existing data found")
+
+            # Step 3: Mine new commits (skipping existing dates)
+            print(f"\n⛏️  Strategy: Mine new commits (skipping existing dates)")
+            metadata = fetch_all_commits_metadata(
+                identifier,
+                agent_name,
+                token,
+                dates_to_skip=existing_dates
+            )
 
             if metadata:
-                print(f"💾 Saving {len(metadata)} commit records...")
+                print(f"💾 Saving {len(metadata)} new commit records...")
                 save_commit_metadata_to_hf(metadata, identifier)
                 print(f"✓ Successfully processed {agent_name}")
             else:
-                print(f"   No commits found for {agent_name}")
+                if not existing_dates:
+                    print(f"   No commits found for {agent_name}")
+                else:
+                    print(f"   No new commits to save (only updated existing data)")
 
         except Exception as e:
             print(f"✗ Error processing {identifier}: {str(e)}")
@@ -778,7 +926,7 @@ def mine_all_agents():
             continue
 
     print(f"\n{'='*80}")
-    print(f"✅ Mining complete for all agents")
+    print(f"✅ SMART mining complete for all agents")
     print(f"{'='*80}\n")
 
 

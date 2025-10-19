@@ -225,7 +225,7 @@ def validate_github_username(identifier):
         return False, f"Validation error: {str(e)}"
 
 
-def fetch_commits_with_time_partition(base_query, start_date, end_date, headers, commits_by_sha, debug_limit=None, depth=0, check_reverts=False):
+def fetch_commits_with_time_partition(base_query, start_date, end_date, headers, commits_by_sha, debug_limit=None, depth=0):
     """
     Fetch commits within a specific time range using time-based partitioning.
     Recursively splits the time range if hitting the 1000-result limit.
@@ -233,7 +233,6 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
     Args:
         debug_limit: If set, stops fetching after this many NEW commits total across all partitions (for testing)
         depth: Current recursion depth (for tracking)
-        check_reverts: DEPRECATED - revert checking is now done in batch after all commits are fetched
 
     Returns the number of commits found in this time partition.
     """
@@ -322,7 +321,7 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
                             split_start = split_start + timedelta(days=1)
 
                         count = fetch_commits_with_time_partition(
-                            base_query, split_start, split_end, headers, commits_by_sha, debug_limit, depth + 1, check_reverts
+                            base_query, split_start, split_end, headers, commits_by_sha, debug_limit, depth + 1
                         )
                         total_from_splits += count
 
@@ -333,10 +332,10 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
 
                     # Recursively fetch both halves
                     count1 = fetch_commits_with_time_partition(
-                        base_query, start_date, mid_date, headers, commits_by_sha, debug_limit, depth + 1, check_reverts
+                        base_query, start_date, mid_date, headers, commits_by_sha, debug_limit, depth + 1
                     )
                     count2 = fetch_commits_with_time_partition(
-                        base_query, mid_date + timedelta(days=1), end_date, headers, commits_by_sha, debug_limit, depth + 1, check_reverts
+                        base_query, mid_date + timedelta(days=1), end_date, headers, commits_by_sha, debug_limit, depth + 1
                     )
 
                     return count1 + count2
@@ -572,60 +571,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
 
     return total_in_partition
 
-
-def check_single_commit_revert_status(sha, headers):
-    """
-    DEPRECATED: Use batch_check_reverts_for_commits() instead for better efficiency.
-
-    Check if a single commit has been reverted by searching GitHub for revert commits.
-
-    Args:
-        sha: Commit SHA to check
-        headers: HTTP headers for GitHub API
-
-    Returns:
-        Dictionary with 'is_reverted' (bool) and 'revert_at' (date string or None)
-    """
-    if not sha:
-        return {'is_reverted': False, 'revert_at': None}
-
-    # Search for commits that mention this SHA in a revert context
-    # Use abbreviated SHA (first 7 characters) which is commonly used in reverts
-    sha_abbr = sha[:7]
-    revert_query = f'"This reverts commit {sha_abbr}"'
-
-    try:
-        url = 'https://api.github.com/search/commits'
-        params = {
-            'q': revert_query,
-            'per_page': 1  # We only need to know if ANY revert exists
-        }
-
-        headers_with_accept = headers.copy() if headers else {}
-        headers_with_accept['Accept'] = 'application/vnd.github.cloak-preview+json'
-
-        response = request_with_backoff('GET', url, headers=headers_with_accept, params=params, max_retries=3)
-
-        if response and response.status_code == 200:
-            data = response.json()
-            total_count = data.get('total_count', 0)
-
-            if total_count > 0:
-                # This commit has been reverted
-                items = data.get('items', [])
-                if items:
-                    # Get the date of the first revert commit
-                    revert_commit = items[0]
-                    revert_at = revert_commit.get('commit', {}).get('author', {}).get('date')
-                    return {'is_reverted': True, 'revert_at': revert_at}
-
-        return {'is_reverted': False, 'revert_at': None}
-
-    except Exception as e:
-        print(f"   Warning: Could not check revert status for {sha_abbr}: {e}")
-        return {'is_reverted': False, 'revert_at': None}
-
-
+    
 def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, end_date=None):
     """
     Check revert status for commits using SCOPED batch approach (highly efficient).
@@ -671,10 +617,10 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
 
         # Build query for this batch of SHAs
         # Search for: "This reverts commit <sha1>" OR "This reverts commit <sha2>" ...
+        # GitHub uses full SHA in revert commit messages
         sha_queries = []
         for sha in batch_shas:
-            sha_abbr = sha[:7]
-            sha_queries.append(f'"This reverts commit {sha_abbr}"')
+            sha_queries.append(f'"This reverts commit {sha}"')
 
         # Combine with OR (GitHub search supports this)
         revert_query = ' OR '.join(sha_queries)
@@ -742,14 +688,13 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
     # Build results for our commits
     results = {}
     for sha in commits_by_sha:
-        sha_abbr = sha[:7].lower()
         sha_lower = sha.lower()
 
-        # Check both full SHA and abbreviated SHA
-        if sha_lower in revert_map or sha_abbr in revert_map:
+        # Check full SHA (primary)
+        if sha_lower in revert_map:
             results[sha] = {
                 'is_reverted': True,
-                'revert_at': revert_map.get(sha_lower) or revert_map.get(sha_abbr)
+                'revert_at': revert_map.get(sha_lower)
             }
         else:
             results[sha] = {
@@ -793,100 +738,6 @@ def extract_commit_metadata(commit, revert_status=None):
         'is_reverted': revert_status.get('is_reverted', False),
         'sha': commit.get('sha')  # Store SHA for revert detection
     }
-
-
-def detect_reverted_commits(metadata_list, headers, token):
-    """
-    DEPRECATED: This function is no longer used. Revert detection is now done using
-    batch_check_reverts_for_commits() after all commits are fetched.
-
-    Legacy function that detected reverts by checking each commit individually.
-    This approach was inefficient - making 1 API call per commit.
-
-    The new approach (batch_check_reverts_for_commits) fetches ALL revert commits
-    in ~10-20 API calls, then matches them against the commits. This is 98% more efficient.
-
-    Searches GitHub for commits containing "This reverts commit {sha}" in the message.
-    Updates metadata_list in-place with revert information.
-
-    In DEBUG MODE: Skips revert detection to avoid API rate limits.
-
-    Args:
-        metadata_list: List of commit metadata dictionaries
-        headers: HTTP headers for GitHub API
-        token: GitHub API token
-
-    Returns:
-        Updated metadata_list with revert information
-    """
-    if not metadata_list:
-        return metadata_list
-
-    # In debug mode, skip revert detection to avoid excessive API calls
-    if DEBUG_MODE:
-        print(f"   🐛 DEBUG MODE: Skipping revert detection for {len(metadata_list)} commits")
-        return metadata_list
-
-    # Build a map of SHA to metadata for quick lookup
-    sha_to_metadata = {meta['sha']: meta for meta in metadata_list if meta.get('sha')}
-
-    reverted_count = 0
-
-    # For each commit, search for potential revert commits
-    # We'll search for commits with message containing the SHA (full or abbreviated)
-    for metadata in metadata_list:
-        sha = metadata.get('sha')
-        if not sha:
-            continue
-
-        # Search for commits that mention this SHA in a revert context
-        # Use abbreviated SHA (first 7 characters) which is commonly used in reverts
-        sha_abbr = sha[:7]
-
-        # Search for revert commits mentioning this SHA
-        revert_query = f'"This reverts commit {sha_abbr}"'
-
-        try:
-            url = 'https://api.github.com/search/commits'
-            params = {
-                'q': revert_query,
-                'per_page': 1  # We only need to know if ANY revert exists
-            }
-
-            headers_with_accept = headers.copy() if headers else {}
-            headers_with_accept['Accept'] = 'application/vnd.github.cloak-preview+json'
-
-            response = request_with_backoff('GET', url, headers=headers_with_accept, params=params, max_retries=3)
-
-            if response and response.status_code == 200:
-                data = response.json()
-                total_count = data.get('total_count', 0)
-
-                if total_count > 0:
-                    # This commit has been reverted
-                    items = data.get('items', [])
-                    if items:
-                        # Get the date of the first revert commit
-                        revert_commit = items[0]
-                        revert_at = revert_commit.get('commit', {}).get('author', {}).get('date')
-
-                        metadata['is_reverted'] = True
-                        metadata['revert_at'] = revert_at
-                        reverted_count += 1
-
-            # Small delay to avoid rate limiting
-            time.sleep(0.1)
-
-        except Exception as e:
-            print(f"   Warning: Could not check revert status for {sha_abbr}: {e}")
-            continue
-
-    if reverted_count > 0:
-        print(f"   ✓ Found {reverted_count} reverted commits")
-    else:
-        print(f"   ✓ No reverted commits found")
-
-    return metadata_list
 
 
 def fetch_daily_commits_metadata(identifier, agent_name, token=None, target_date=None, check_reverts=False):
@@ -937,8 +788,7 @@ def fetch_daily_commits_metadata(identifier, agent_name, token=None, target_date
             end_date,
             headers,
             commits_by_sha,
-            debug_limit_per_pattern=None,
-            check_reverts=False
+            debug_limit_per_pattern=None
         )
 
     all_commits = list(commits_by_sha.values())
@@ -1148,8 +998,7 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, start_from_da
             end_date,
             headers,
             commits_by_sha,
-            debug_limit_per_pattern,
-            check_reverts=False  # Never check inline, we'll do batch checking after
+            debug_limit_per_pattern
         )
 
         pattern_duration = time.time() - pattern_start_time

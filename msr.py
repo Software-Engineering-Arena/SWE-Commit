@@ -189,10 +189,11 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
 
         # Build query for this batch of SHAs
         # Search for: "This reverts commit <sha1>" OR "This reverts commit <sha2>" ...
-        # GitHub uses full SHA in revert commit messages
+        # GitHub uses abbreviated (7-char) SHA in revert commit messages by default
         sha_queries = []
         for sha in batch_shas:
-            sha_queries.append(f'"This reverts commit {sha}"')
+            sha_abbr = sha[:7]  # Use 7-char abbreviated SHA
+            sha_queries.append(f'"This reverts commit {sha_abbr}"')
 
         # Combine with OR (GitHub search supports this)
         revert_query = ' OR '.join(sha_queries)
@@ -261,18 +262,24 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
     results = {}
     for sha in commits_by_sha:
         sha_lower = sha.lower()
+        found_revert = False
+        revert_date = None
 
-        # Check full SHA (primary)
-        if sha_lower in revert_map:
-            results[sha] = {
-                'is_reverted': True,
-                'revert_at': revert_map.get(sha_lower)
-            }
-        else:
-            results[sha] = {
-                'is_reverted': False,
-                'revert_at': None
-            }
+        # Check if any extracted SHA matches this commit
+        # Match by prefix to handle abbreviated SHAs safely
+        for extracted_sha, date in revert_map.items():
+            # Match if:
+            # 1. Full SHA matches (sha_lower == extracted_sha), OR
+            # 2. Abbreviated SHA matches AND it's a prefix of our full SHA
+            if extracted_sha == sha_lower or (len(extracted_sha) >= 7 and sha_lower.startswith(extracted_sha)):
+                found_revert = True
+                revert_date = date
+                break
+
+        results[sha] = {
+            'is_reverted': found_revert,
+            'revert_at': revert_date
+        }
 
     reverted_count = sum(1 for r in results.values() if r['is_reverted'])
     print(f"   ✅ Scoped batch check complete: {reverted_count}/{len(results)} commits were reverted")

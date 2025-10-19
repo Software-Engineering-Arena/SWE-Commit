@@ -240,8 +240,8 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
     start_str = start_date.strftime('%Y-%m-%d')
     end_str = end_date.strftime('%Y-%m-%d')
 
-    # Add date range to query (use committer-date for commits)
-    query = f'{base_query} committer-date:{start_str}..{end_str}'
+    # Add date range to query (use author-date for commits)
+    query = f'{base_query} author-date:{start_str}..{end_str}'
 
     indent = "  " + "  " * depth
     print(f"{indent}Searching range {start_str} to {end_str}...")
@@ -260,7 +260,7 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
             'q': query,
             'per_page': per_page,
             'page': page,
-            'sort': 'committer-date',
+            'sort': 'author-date',
             'order': 'asc'
         }
         # Add required header for commit search API
@@ -630,7 +630,7 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
         if start_date and end_date:
             start_str = start_date.strftime('%Y-%m-%d')
             end_str = end_date.strftime('%Y-%m-%d')
-            revert_query += f' committer-date:{start_str}..{end_str}'
+            revert_query += f' author-date:{start_str}..{end_str}'
 
         # Fetch revert commits for this batch
         page = 1
@@ -642,7 +642,7 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
                 'q': revert_query,
                 'per_page': per_page,
                 'page': page,
-                'sort': 'committer-date',
+                'sort': 'author-date',
                 'order': 'asc'
             }
 

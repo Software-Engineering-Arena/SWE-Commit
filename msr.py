@@ -287,21 +287,34 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
     return results
 
 
-def fetch_commits_with_time_partition(base_query, start_date, end_date, headers, commits_by_sha, depth=0, dates_to_skip=None):
+def fetch_commits_with_time_partition(base_query, start_date, end_date, headers, commits_by_sha, depth=0, dates_to_skip=None, max_recursion_depth=8):
     """
     Fetch commits within a specific time range using time-based partitioning.
     Recursively splits the time range if hitting the 1000-result limit.
+    Uses intelligent splitting: days at shallow depth, then hours/minutes/seconds at deeper depths.
 
     Args:
+        base_query: GitHub search query pattern
+        start_date: Start datetime for the range
+        end_date: End datetime for the range
+        headers: HTTP headers for GitHub API
+        commits_by_sha: Dict to accumulate commits keyed by SHA
+        depth: Current recursion depth
         dates_to_skip: Set of (year, month, day) tuples to skip during mining
+        max_recursion_depth: Maximum recursion depth before giving up (prevents infinite recursion)
 
     Returns the number of commits found in this time partition.
     """
     if dates_to_skip is None:
         dates_to_skip = set()
 
-    # Check if this entire date range should be skipped
-    # If start and end are the same day and it's in dates_to_skip, skip it
+    # Safety check: prevent infinite recursion
+    if depth > max_recursion_depth:
+        indent = "  " + "  " * depth
+        print(f"{indent}⚠️ Reached maximum recursion depth ({max_recursion_depth}). Stopping recursive partitioning.")
+        return 0
+
+    # Check if this entire date range should be skipped (only for day-level comparisons)
     if start_date.date() == end_date.date():
         date_key = (start_date.year, start_date.month, start_date.day)
         if date_key in dates_to_skip:
@@ -309,15 +322,23 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
             print(f"{indent}⏭️  Skipping {start_date.strftime('%Y-%m-%d')} (already exists)")
             return 0
 
-    # Format dates for GitHub search (YYYY-MM-DD)
-    start_str = start_date.strftime('%Y-%m-%d')
-    end_str = end_date.strftime('%Y-%m-%d')
+    # Format dates for GitHub search
+    # Use full ISO format with time for hour/minute/second precision at deeper recursion levels
+    if depth == 0:
+        # Day-level precision for initial query
+        start_str = start_date.strftime('%Y-%m-%d')
+        end_str = end_date.strftime('%Y-%m-%d')
+    else:
+        # Higher precision (ISO format) for deeper recursion levels
+        start_str = start_date.isoformat().split('.')[0]  # Remove microseconds
+        end_str = end_date.isoformat().split('.')[0]
 
     # Add date range to query (use committer-date for commits)
     query = f'{base_query} committer-date:{start_str}..{end_str}'
 
     indent = "  " + "  " * depth
-    print(f"{indent}Searching range {start_str} to {end_str}...")
+    time_display = start_str if depth == 0 else f"{start_str} to {end_str}"
+    print(f"{indent}Searching range {time_display}...")
 
     page = 1
     per_page = 100
@@ -365,45 +386,56 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
                 print(f"{indent}  ⚠️ Hit 1000-result limit ({total_count} total). Splitting time range...")
 
                 time_diff = end_date - start_date
-                days_diff = time_diff.days
 
-                # Use aggressive splitting for large ranges or deep recursion
-                if days_diff > 30 or depth > 5:
-                    # Split into 4 parts for more aggressive partitioning
-                    quarter_diff = time_diff / 4
-                    split_dates = [
-                        start_date,
-                        start_date + quarter_diff,
-                        start_date + quarter_diff * 2,
-                        start_date + quarter_diff * 3,
-                        end_date
-                    ]
-
-                    total_from_splits = 0
-                    for i in range(4):
-                        split_start = split_dates[i]
-                        split_end = split_dates[i + 1]
-                        if i > 0:
-                            split_start = split_start + timedelta(days=1)
-
-                        count = fetch_commits_with_time_partition(
-                            base_query, split_start, split_end, headers, commits_by_sha, depth + 1, dates_to_skip
-                        )
-                        total_from_splits += count
-
-                    return total_from_splits
+                # Intelligent splitting strategy based on recursion depth and time granularity
+                if depth < 2:
+                    # At shallow depth: split by days (largest granularity)
+                    split_strategy = "days"
+                    num_splits = 4
+                elif depth < 4:
+                    # At medium depth: split by hours
+                    split_strategy = "hours"
+                    num_splits = 4
                 else:
-                    # Binary split for smaller ranges
-                    mid_date = start_date + time_diff / 2
+                    # At deep depth: split by minutes/seconds (smallest granularity)
+                    split_strategy = "minutes"
+                    num_splits = 4
 
-                    count1 = fetch_commits_with_time_partition(
-                        base_query, start_date, mid_date, headers, commits_by_sha, depth + 1, dates_to_skip
-                    )
-                    count2 = fetch_commits_with_time_partition(
-                        base_query, mid_date + timedelta(days=1), end_date, headers, commits_by_sha, depth + 1, dates_to_skip
-                    )
+                print(f"{indent}    Using {split_strategy}-based splitting (depth={depth})")
 
-                    return count1 + count2
+                # Generate split timestamps based on strategy
+                split_dates = []
+                if split_strategy == "days":
+                    quarter_diff = time_diff / num_splits
+                    for i in range(num_splits + 1):
+                        split_dates.append(start_date + quarter_diff * i)
+                elif split_strategy == "hours":
+                    total_hours = time_diff.total_seconds() / 3600
+                    hour_diff = total_hours / num_splits
+                    for i in range(num_splits + 1):
+                        split_dates.append(start_date + timedelta(hours=hour_diff * i))
+                else:  # minutes
+                    total_minutes = time_diff.total_seconds() / 60
+                    minute_diff = total_minutes / num_splits
+                    for i in range(num_splits + 1):
+                        split_dates.append(start_date + timedelta(minutes=minute_diff * i))
+
+                total_from_splits = 0
+                for i in range(len(split_dates) - 1):
+                    split_start = split_dates[i]
+                    split_end = split_dates[i + 1]
+
+                    # Add small offset to avoid overlap in range boundaries
+                    if i > 0:
+                        split_start = split_start + timedelta(seconds=1)
+
+                    count = fetch_commits_with_time_partition(
+                        base_query, split_start, split_end, headers, commits_by_sha, 
+                        depth + 1, dates_to_skip, max_recursion_depth
+                    )
+                    total_from_splits += count
+
+                return total_from_splits
 
             # Normal pagination: check if there are more pages
             if len(items) < per_page or page >= 10:
@@ -417,7 +449,7 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
             return total_in_partition
 
     if total_in_partition > 0:
-        print(f"{indent}  ✓ Found {total_in_partition} commits in range {start_str} to {end_str}")
+        print(f"{indent}  ✓ Found {total_in_partition} commits in range {time_display}")
 
     return total_in_partition
 
@@ -446,6 +478,13 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, dates_to_skip
     Fetch commits associated with a GitHub user or bot for the past LEADERBOARD_TIME_FRAME_DAYS.
     Returns lightweight metadata instead of full commit objects.
 
+    HYBRID ITERATIVE-RECURSIVE APPROACH:
+    - OUTER LOOP (Iterative): Mines each day separately (180 iterations for 6 months)
+    - INNER LOOP (Recursive): When hitting 1000-result limit, splits by hour/minute/second
+    - MAX RECURSION DEPTH: Limited to 8 to prevent stack overflow
+
+    This prevents recursion depth issues while efficiently mining all commits within the timeframe.
+
     Revert status is checked in BATCH after all commits are fetched using
     batch_check_reverts_for_commits(). This is 98% more efficient than checking
     each commit individually during retrieval.
@@ -464,9 +503,8 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, dates_to_skip
 
     headers = {'Authorization': f'token {token}'} if token else {}
 
-    # Define query patterns
-    query_patterns = []
-    query_patterns.append(f'is:commit author:{identifier}')
+    # Define query pattern
+    query_pattern = f'is:commit author:{identifier}'
 
     commits_by_sha = {}
 
@@ -475,32 +513,70 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, dates_to_skip
     start_date = current_time - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
     end_date = current_time
 
-    for query_pattern in query_patterns:
-        print(f"\n🔍 Searching with query: {query_pattern}")
-        print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-        if dates_to_skip:
-            print(f"   Skipping {len(dates_to_skip)} existing date(s)")
+    print(f"\n🔍 Searching with query: {query_pattern}")
+    print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    if dates_to_skip:
+        print(f"   Skipping {len(dates_to_skip)} existing date(s)")
 
-        pattern_start_time = time.time()
+    # OUTER ITERATIVE LOOP: Mine each day separately
+    # This avoids hitting the recursion depth limit that plagued range-based queries
+    print(f"\n📅 Mining strategy: Iterating through {LEADERBOARD_TIME_FRAME_DAYS} days (outer loop)")
+    print(f"    Each day uses recursive partitioning if hitting 1000-result limit (inner loop)")
+
+    total_days_mined = 0
+    total_commits_found = 0
+    pattern_start_time = time.time()
+
+    current_day = start_date
+    while current_day <= end_date:
+        date_key = (current_day.year, current_day.month, current_day.day)
+
+        # Check if this day should be skipped
+        if date_key in dates_to_skip:
+            print(f"   ⏭️  Skipping {current_day.strftime('%Y-%m-%d')} (already exists)")
+            current_day += timedelta(days=1)
+            continue
+
+        day_start = current_day.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = current_day.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+        day_date_str = current_day.strftime('%Y-%m-%d')
+        print(f"\n   📆 Mining day {day_date_str}...")
+        day_start_time = time.time()
         initial_count = len(commits_by_sha)
 
-        # Fetch with time partitioning (no inline revert checking)
+        # INNER RECURSIVE LOOP: For this specific day, use time-based partitioning
+        # This recursively splits by hour/minute/second if needed, but stays within max depth
         commits_found = fetch_commits_with_time_partition(
             query_pattern,
-            start_date,
-            end_date,
+            day_start,
+            day_end,
             headers,
             commits_by_sha,
-            dates_to_skip=dates_to_skip
+            depth=0,
+            dates_to_skip=dates_to_skip,
+            max_recursion_depth=8  # Safely limit recursion
         )
 
-        pattern_duration = time.time() - pattern_start_time
-        new_commits = len(commits_by_sha) - initial_count
+        day_duration = time.time() - day_start_time
+        new_commits_today = len(commits_by_sha) - initial_count
+        total_commits_found += new_commits_today
+        total_days_mined += 1
 
-        print(f"   ✓ Pattern complete: {new_commits} new commits found ({commits_found} total fetched)")
-        print(f"   ⏱️ Time taken: {pattern_duration:.1f} seconds")
+        if new_commits_today > 0:
+            print(f"      Found {new_commits_today} new commits today ({day_duration:.1f}s)")
 
-        time.sleep(1.0)
+        current_day += timedelta(days=1)
+
+        # Courtesy delay between days to avoid rate limiting
+        time.sleep(0.3)
+
+    pattern_duration = time.time() - pattern_start_time
+
+    print(f"\n   ✓ Iterative mining complete:")
+    print(f"     - Days processed: {total_days_mined}/{LEADERBOARD_TIME_FRAME_DAYS}")
+    print(f"     - Total unique commits: {len(commits_by_sha)}")
+    print(f"     ⏱️ Time taken: {pattern_duration:.1f} seconds")
 
     all_commits = list(commits_by_sha.values())
 

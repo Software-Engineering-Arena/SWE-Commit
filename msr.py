@@ -52,12 +52,45 @@ def save_jsonl(filename, data):
             f.write(json.dumps(item) + '\n')
 
 
-def get_github_token():
-    """Get GitHub token from environment variables."""
-    token = os.getenv('GITHUB_TOKEN')
-    if not token:
-        print("Warning: GITHUB_TOKEN not found. API rate limits: 60/hour (authenticated: 5000/hour)")
-    return token
+def get_github_tokens():
+    """
+    Get all GitHub tokens from environment variables.
+    Returns a list of tokens that have the GITHUB_TOKEN prefix.
+    """
+    tokens = []
+    for key, value in os.environ.items():
+        if key.startswith('GITHUB_TOKEN') and value:
+            tokens.append(value)
+
+    if not tokens:
+        print("Warning: No GITHUB_TOKEN* found. API rate limits: 60/hour (authenticated: 5000/hour)")
+    else:
+        print(f"Loaded {len(tokens)} GitHub token(s) from environment")
+
+    return tokens
+
+
+class TokenPool:
+    """
+    Manages a pool of GitHub tokens for load balancing across rate limits.
+    Rotates through tokens in round-robin fashion to distribute API calls.
+    """
+    def __init__(self, tokens):
+        self.tokens = tokens if tokens else [None]
+        self.current_index = 0
+
+    def get_next_token(self):
+        """Get the next token in round-robin order."""
+        if not self.tokens:
+            return None
+        token = self.tokens[self.current_index]
+        self.current_index = (self.current_index + 1) % len(self.tokens)
+        return token
+
+    def get_headers(self):
+        """Get headers with the next token in rotation."""
+        token = self.get_next_token()
+        return {'Authorization': f'token {token}'} if token else {}
 
 
 def get_hf_token():
@@ -144,7 +177,7 @@ def request_with_backoff(method, url, *, headers=None, params=None, json_body=No
     return None
 
 
-def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, end_date=None):
+def batch_check_reverts_for_commits(commits_by_sha, token_pool, start_date=None, end_date=None):
     """
     Check revert status for commits using SCOPED batch approach (highly efficient).
 
@@ -160,7 +193,7 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
 
     Args:
         commits_by_sha: Dict of commits keyed by SHA
-        headers: HTTP headers for GitHub API
+        token_pool: TokenPool instance for rotating through GitHub tokens
         start_date: Optional start date to filter revert commits (datetime object)
         end_date: Optional end date to filter revert commits (datetime object)
 
@@ -218,10 +251,10 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
                 'order': 'asc'
             }
 
-            headers_with_accept = headers.copy() if headers else {}
-            headers_with_accept['Accept'] = 'application/vnd.github.cloak-preview+json'
+            headers = token_pool.get_headers()
+            headers['Accept'] = 'application/vnd.github.cloak-preview+json'
 
-            response = request_with_backoff('GET', url, headers=headers_with_accept, params=params, max_retries=3)
+            response = request_with_backoff('GET', url, headers=headers, params=params, max_retries=3)
 
             if not response or response.status_code != 200:
                 break
@@ -287,7 +320,7 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
     return results
 
 
-def fetch_commits_with_time_partition(base_query, start_date, end_date, headers, commits_by_sha, depth=0, dates_to_skip=None, max_recursion_depth=8):
+def fetch_commits_with_time_partition(base_query, start_date, end_date, token_pool, commits_by_sha, depth=0, dates_to_skip=None, max_recursion_depth=8):
     """
     Fetch commits within a specific time range using time-based partitioning.
     Recursively splits the time range if hitting the 1000-result limit.
@@ -297,7 +330,7 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
         base_query: GitHub search query pattern
         start_date: Start datetime for the range
         end_date: End datetime for the range
-        headers: HTTP headers for GitHub API
+        token_pool: TokenPool instance for rotating through GitHub tokens
         commits_by_sha: Dict to accumulate commits keyed by SHA
         depth: Current recursion depth
         dates_to_skip: Set of (year, month, day) tuples to skip during mining
@@ -354,11 +387,11 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
             'order': 'asc'
         }
 
-        headers_with_accept = headers.copy() if headers else {}
-        headers_with_accept['Accept'] = 'application/vnd.github.cloak-preview+json'
+        headers = token_pool.get_headers()
+        headers['Accept'] = 'application/vnd.github.cloak-preview+json'
 
         try:
-            response = request_with_backoff('GET', url, headers=headers_with_accept, params=params)
+            response = request_with_backoff('GET', url, headers=headers, params=params)
             if response is None:
                 print(f"{indent}  Error: retries exhausted for range {start_str} to {end_str}")
                 return total_in_partition
@@ -430,7 +463,7 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
                         split_start = split_start + timedelta(seconds=1)
 
                     count = fetch_commits_with_time_partition(
-                        base_query, split_start, split_end, headers, commits_by_sha, 
+                        base_query, split_start, split_end, token_pool, commits_by_sha,
                         depth + 1, dates_to_skip, max_recursion_depth
                     )
                     total_from_splits += count
@@ -473,7 +506,7 @@ def extract_commit_metadata(commit, revert_status=None):
     }
 
 
-def fetch_all_commits_metadata(identifier, agent_name, token=None, dates_to_skip=None):
+def fetch_all_commits_metadata(identifier, agent_name, token_pool, dates_to_skip=None):
     """
     Fetch commits associated with a GitHub user or bot for the past LEADERBOARD_TIME_FRAME_DAYS.
     Returns lightweight metadata instead of full commit objects.
@@ -492,7 +525,7 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, dates_to_skip
     Args:
         identifier: GitHub username or bot identifier
         agent_name: Human-readable name of the agent for metadata purposes
-        token: GitHub API token for authentication
+        token_pool: TokenPool instance for rotating through GitHub tokens
         dates_to_skip: Set of (year, month, day) tuples to skip during mining
 
     Returns:
@@ -500,8 +533,6 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, dates_to_skip
     """
     if dates_to_skip is None:
         dates_to_skip = set()
-
-    headers = {'Authorization': f'token {token}'} if token else {}
 
     # Define query pattern
     query_pattern = f'is:commit author:{identifier}'
@@ -551,7 +582,7 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, dates_to_skip
             query_pattern,
             day_start,
             day_end,
-            headers,
+            token_pool,
             commits_by_sha,
             depth=0,
             dates_to_skip=dates_to_skip,
@@ -585,7 +616,7 @@ def fetch_all_commits_metadata(identifier, agent_name, token=None, dates_to_skip
         print(f"\n🔄 Checking revert status for all commits in batch...")
         revert_results = batch_check_reverts_for_commits(
             commits_by_sha,
-            headers,
+            token_pool,
             start_date=start_date,
             end_date=end_date
         )
@@ -663,7 +694,7 @@ def upload_with_retry(api, path_or_fileobj, path_in_repo, repo_id, repo_type, to
                 raise
 
 
-def update_revert_status_for_existing_dates(agent_identifier, existing_dates, token=None):
+def update_revert_status_for_existing_dates(agent_identifier, existing_dates, token_pool):
     """
     Update only the revert status for commits on existing dates.
     This is much more efficient than re-mining all commit data.
@@ -671,7 +702,7 @@ def update_revert_status_for_existing_dates(agent_identifier, existing_dates, to
     Args:
         agent_identifier: GitHub identifier of the agent
         existing_dates: Set of (year, month, day) tuples that already have data
-        token: GitHub API token for authentication
+        token_pool: TokenPool instance for rotating through GitHub tokens
 
     Returns:
         Number of files updated
@@ -680,8 +711,6 @@ def update_revert_status_for_existing_dates(agent_identifier, existing_dates, to
         return 0
 
     print(f"\n🔄 Updating revert status for {len(existing_dates)} existing date(s)...")
-
-    headers = {'Authorization': f'token {token}'} if token else {}
     hf_token = get_hf_token()
     if not hf_token:
         raise Exception("No HuggingFace token found")
@@ -733,7 +762,7 @@ def update_revert_status_for_existing_dates(agent_identifier, existing_dates, to
             # Batch check revert status
             revert_results = batch_check_reverts_for_commits(
                 commits_by_sha,
-                headers,
+                token_pool,
                 start_date=start_date,
                 end_date=end_date
             )
@@ -938,8 +967,12 @@ def mine_all_agents():
     1. Check which (date, agent) combinations already exist in COMMIT_METADATA_REPO
     2. For existing dates: Only update revert status (much faster)
     3. For missing dates: Mine commit metadata from scratch
+
+    Uses token pool to rotate through multiple GitHub tokens to minimize rate limiting.
     """
-    token = get_github_token()
+    # Initialize token pool from all GITHUB_TOKEN* environment variables
+    tokens = get_github_tokens()
+    token_pool = TokenPool(tokens)
 
     # Load agent metadata from HuggingFace
     agents = load_agents_from_hf()
@@ -975,7 +1008,7 @@ def mine_all_agents():
 
                 # Step 2: Update revert status for existing dates
                 print(f"\n🔄 Strategy: Update revert status for existing dates")
-                update_revert_status_for_existing_dates(identifier, existing_dates, token)
+                update_revert_status_for_existing_dates(identifier, existing_dates, token_pool)
             else:
                 print(f"   No existing data found")
 
@@ -984,7 +1017,7 @@ def mine_all_agents():
             metadata = fetch_all_commits_metadata(
                 identifier,
                 agent_name,
-                token,
+                token_pool,
                 dates_to_skip=existing_dates
             )
 

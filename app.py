@@ -198,8 +198,49 @@ def request_with_backoff(method, url, *, headers=None, params=None, json_body=No
     print(f"Exceeded max retries for {url}")
     return None
 
+def get_github_tokens():
+    """
+    Get all GitHub tokens from environment variables.
+    Returns a list of tokens that have the GITHUB_TOKEN prefix.
+    """
+    tokens = []
+    for key, value in os.environ.items():
+        if key.startswith('GITHUB_TOKEN') and value:
+            tokens.append(value)
+
+    if not tokens:
+        print("Warning: No GITHUB_TOKEN* found. API rate limits: 60/hour (authenticated: 5000/hour)")
+    else:
+        print(f"Loaded {len(tokens)} GitHub token(s) from environment")
+
+    return tokens
+
+
+class TokenPool:
+    """
+    Manages a pool of GitHub tokens for load balancing across rate limits.
+    Rotates through tokens in round-robin fashion to distribute API calls.
+    """
+    def __init__(self, tokens):
+        self.tokens = tokens if tokens else [None]
+        self.current_index = 0
+
+    def get_next_token(self):
+        """Get the next token in round-robin order."""
+        if not self.tokens:
+            return None
+        token = self.tokens[self.current_index]
+        self.current_index = (self.current_index + 1) % len(self.tokens)
+        return token
+
+    def get_headers(self):
+        """Get headers with the next token in rotation."""
+        token = self.get_next_token()
+        return {'Authorization': f'token {token}'} if token else {}
+
+
 def get_github_token():
-    """Get GitHub token from environment variables."""
+    """Get first GitHub token from environment variables (for backward compatibility)."""
     token = os.getenv('GITHUB_TOKEN')
     if not token:
         print("Warning: GITHUB_TOKEN not found. API rate limits: 60/hour (authenticated: 5000/hour)")
@@ -225,12 +266,13 @@ def validate_github_username(identifier):
         return False, f"Validation error: {str(e)}"
 
 
-def fetch_commits_with_time_partition(base_query, start_date, end_date, headers, commits_by_sha, debug_limit=None, depth=0):
+def fetch_commits_with_time_partition(base_query, start_date, end_date, token_pool, commits_by_sha, debug_limit=None, depth=0):
     """
     Fetch commits within a specific time range using time-based partitioning.
     Recursively splits the time range if hitting the 1000-result limit.
 
     Args:
+        token_pool: TokenPool instance for rotating through GitHub tokens
         debug_limit: If set, stops fetching after this many NEW commits total across all partitions (for testing)
         depth: Current recursion depth (for tracking)
 
@@ -264,11 +306,11 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
             'order': 'asc'
         }
         # Add required header for commit search API
-        headers_with_accept = headers.copy() if headers else {}
-        headers_with_accept['Accept'] = 'application/vnd.github.cloak-preview+json'
+        headers = token_pool.get_headers()
+        headers['Accept'] = 'application/vnd.github.cloak-preview+json'
 
         try:
-            response = request_with_backoff('GET', url, headers=headers_with_accept, params=params)
+            response = request_with_backoff('GET', url, headers=headers, params=params)
             if response is None:
                 print(f"{indent}  Error: retries exhausted for range {start_str} to {end_str}")
                 return total_in_partition
@@ -321,7 +363,7 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
                             split_start = split_start + timedelta(days=1)
 
                         count = fetch_commits_with_time_partition(
-                            base_query, split_start, split_end, headers, commits_by_sha, debug_limit, depth + 1
+                            base_query, split_start, split_end, token_pool, commits_by_sha, debug_limit, depth + 1
                         )
                         total_from_splits += count
 
@@ -332,10 +374,10 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
 
                     # Recursively fetch both halves
                     count1 = fetch_commits_with_time_partition(
-                        base_query, start_date, mid_date, headers, commits_by_sha, debug_limit, depth + 1
+                        base_query, start_date, mid_date, token_pool, commits_by_sha, debug_limit, depth + 1
                     )
                     count2 = fetch_commits_with_time_partition(
-                        base_query, mid_date + timedelta(days=1), end_date, headers, commits_by_sha, debug_limit, depth + 1
+                        base_query, mid_date + timedelta(days=1), end_date, token_pool, commits_by_sha, debug_limit, depth + 1
                     )
 
                     return count1 + count2
@@ -357,13 +399,14 @@ def fetch_commits_with_time_partition(base_query, start_date, end_date, headers,
     return total_in_partition
 
 
-def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs_by_id, debug_limit=None, depth=0):
+def fetch_prs_with_time_partition(base_query, start_date, end_date, token_pool, prs_by_id, debug_limit=None, depth=0):
     """
     Fetch PRs within a specific time range using time-based partitioning.
     Recursively splits the time range if hitting the 1000-result limit.
     Supports splitting by day, hour, minute, and second as needed.
 
     Args:
+        token_pool: TokenPool instance for rotating through GitHub tokens
         debug_limit: If set, stops fetching after this many PRs (for testing)
         depth: Current recursion depth (for tracking)
 
@@ -416,6 +459,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
         }
 
         try:
+            headers = token_pool.get_headers()
             response = request_with_backoff('GET', url, headers=headers, params=params)
             if response is None:
                 print(f"{indent}  Error: retries exhausted for range {start_str} to {end_str}")
@@ -463,7 +507,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
                             split_start = split_start + timedelta(seconds=1)
 
                         count = fetch_prs_with_time_partition(
-                            base_query, split_start, split_end, headers, prs_by_id, debug_limit, depth + 1
+                            base_query, split_start, split_end, token_pool, prs_by_id, debug_limit, depth + 1
                         )
                         total_from_splits += count
 
@@ -484,7 +528,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
                             split_start = split_start + timedelta(minutes=1)
 
                         count = fetch_prs_with_time_partition(
-                            base_query, split_start, split_end, headers, prs_by_id, debug_limit, depth + 1
+                            base_query, split_start, split_end, token_pool, prs_by_id, debug_limit, depth + 1
                         )
                         total_from_splits += count
 
@@ -505,7 +549,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
                             split_start = split_start + timedelta(hours=1)
 
                         count = fetch_prs_with_time_partition(
-                            base_query, split_start, split_end, headers, prs_by_id, debug_limit, depth + 1
+                            base_query, split_start, split_end, token_pool, prs_by_id, debug_limit, depth + 1
                         )
                         total_from_splits += count
 
@@ -536,7 +580,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
                                 split_start = split_start + timedelta(days=1)
 
                             count = fetch_prs_with_time_partition(
-                                base_query, split_start, split_end, headers, prs_by_id, debug_limit, depth + 1
+                                base_query, split_start, split_end, token_pool, prs_by_id, debug_limit, depth + 1
                             )
                             total_from_splits += count
 
@@ -547,10 +591,10 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
 
                         # Recursively fetch both halves
                         count1 = fetch_prs_with_time_partition(
-                            base_query, start_date, mid_date, headers, prs_by_id, debug_limit, depth + 1
+                            base_query, start_date, mid_date, token_pool, prs_by_id, debug_limit, depth + 1
                         )
                         count2 = fetch_prs_with_time_partition(
-                            base_query, mid_date + timedelta(days=1), end_date, headers, prs_by_id, debug_limit, depth + 1
+                            base_query, mid_date + timedelta(days=1), end_date, token_pool, prs_by_id, debug_limit, depth + 1
                         )
 
                         return count1 + count2
@@ -572,7 +616,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
     return total_in_partition
 
     
-def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, end_date=None):
+def batch_check_reverts_for_commits(commits_by_sha, token_pool, start_date=None, end_date=None):
     """
     Check revert status for commits using SCOPED batch approach (highly efficient).
 
@@ -588,7 +632,7 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
 
     Args:
         commits_by_sha: Dict of commits keyed by SHA
-        headers: HTTP headers for GitHub API
+        token_pool: TokenPool instance for rotating through GitHub tokens
         start_date: Optional start date to filter revert commits (datetime object)
         end_date: Optional end date to filter revert commits (datetime object)
 
@@ -646,10 +690,10 @@ def batch_check_reverts_for_commits(commits_by_sha, headers, start_date=None, en
                 'order': 'asc'
             }
 
-            headers_with_accept = headers.copy() if headers else {}
-            headers_with_accept['Accept'] = 'application/vnd.github.cloak-preview+json'
+            headers = token_pool.get_headers()
+            headers['Accept'] = 'application/vnd.github.cloak-preview+json'
 
-            response = request_with_backoff('GET', url, headers=headers_with_accept, params=params, max_retries=3)
+            response = request_with_backoff('GET', url, headers=headers, params=params, max_retries=3)
 
             if not response or response.status_code != 200:
                 break
@@ -747,7 +791,7 @@ def extract_commit_metadata(commit, revert_status=None):
     }
 
 
-def fetch_daily_commits_metadata(identifier, agent_name, token=None, target_date=None, check_reverts=False):
+def fetch_daily_commits_metadata(identifier, agent_name, token_pool, target_date=None, check_reverts=False):
     """
     Fetch commits for a specific day (12am to 12am UTC).
     Used for daily incremental updates.
@@ -755,14 +799,13 @@ def fetch_daily_commits_metadata(identifier, agent_name, token=None, target_date
     Args:
         identifier: GitHub username or bot identifier
         agent_name: Human-readable name of the agent for metadata purposes
-        token: GitHub API token for authentication
+        token_pool: TokenPool instance for rotating through GitHub tokens
         target_date: Date to fetch commits for (defaults to yesterday)
         check_reverts: Whether to check revert status (default: False for new commits)
 
     Returns:
         List of dictionaries containing minimal commit metadata
     """
-    headers = {'Authorization': f'token {token}'} if token else {}
 
     # Calculate target date range (12am yesterday to 12am today)
     if target_date is None:
@@ -790,9 +833,9 @@ def fetch_daily_commits_metadata(identifier, agent_name, token=None, target_date
             query_pattern,
             start_date,
             end_date,
-            headers,
+            token_pool,
             commits_by_sha,
-            debug_limit_per_pattern=None
+            debug_limit=None
         )
 
     all_commits = list(commits_by_sha.values())
@@ -802,7 +845,7 @@ def fetch_daily_commits_metadata(identifier, agent_name, token=None, target_date
         print(f"\n🔄 Checking revert status for {len(all_commits)} commits...")
         revert_results = batch_check_reverts_for_commits(
             commits_by_sha,
-            headers,
+            token_pool,
             start_date=start_date,
             end_date=end_date
         )
@@ -819,7 +862,7 @@ def fetch_daily_commits_metadata(identifier, agent_name, token=None, target_date
     return metadata_list
 
 
-def update_revert_status_for_recent_commits(token=None):
+def update_revert_status_for_recent_commits(token_pool):
     """
     Update revert status for all commits within LEADERBOARD_TIME_FRAME_DAYS - 1.
     This is used during daily updates to refresh revert status for recent commits.
@@ -830,12 +873,11 @@ def update_revert_status_for_recent_commits(token=None):
     3. Save updated metadata back to HuggingFace for ALL agents
 
     Args:
-        token: GitHub API token for authentication
+        token_pool: TokenPool instance for rotating through GitHub tokens
 
     Returns:
         Number of commits processed
     """
-    headers = {'Authorization': f'token {token}'} if token else {}
 
     print(f"\n{'='*80}")
     print(f"🔄 Updating revert status for recent commits (last {LEADERBOARD_TIME_FRAME_DAYS - 1} days)")
@@ -900,7 +942,7 @@ def update_revert_status_for_recent_commits(token=None):
         if not DEBUG_MODE:
             revert_results = batch_check_reverts_for_commits(
                 commits_by_sha,
-                headers,
+                token_pool,
                 start_date=start_date,
                 end_date=end_date
             )
@@ -1766,7 +1808,9 @@ def update_all_agents_incremental():
     print(f"{'='*80}")
 
     try:
-        token = get_github_token()
+        # Initialize token pool from all GITHUB_TOKEN* environment variables
+        tokens = get_github_tokens()
+        token_pool = TokenPool(tokens)
 
         # Load agent metadata from HuggingFace
         agents = load_agents_from_hf()
@@ -1775,7 +1819,7 @@ def update_all_agents_incremental():
             return
 
         # Update revert status for all recent commits
-        update_revert_status_for_recent_commits(token)
+        update_revert_status_for_recent_commits(token_pool)
 
         # Update each agent
         for agent in agents:
@@ -1796,7 +1840,7 @@ def update_all_agents_incremental():
                 new_metadata = fetch_daily_commits_metadata(
                     identifier,
                     agent_name,
-                    token,
+                    token_pool,
                     target_date=None,  # Yesterday by default
                     check_reverts=False  # Revert checking already done in bulk above
                 )

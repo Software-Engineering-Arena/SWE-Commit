@@ -933,7 +933,10 @@ def update_revert_status_for_recent_commits(token_pool):
                     }
                 }
 
-    # Update revert status for each agent's commits
+    # Update revert status for each agent's commits (with batch upload per agent)
+    import tempfile
+    import shutil
+
     total_updated = 0
     for agent_id, commits_by_sha in commits_by_agent.items():
         print(f"\n   Processing {agent_id}: {len(commits_by_sha)} commits")
@@ -950,7 +953,7 @@ def update_revert_status_for_recent_commits(token_pool):
             # Update metadata with new revert status for THIS agent
             # Group by date for saving
             commits_by_date = defaultdict(list)
-            
+
             for commit_meta in recent_commits:
                 if commit_meta.get('agent_identifier') == agent_id:
                     sha = commit_meta.get('sha')
@@ -959,7 +962,7 @@ def update_revert_status_for_recent_commits(token_pool):
                         revert_status = revert_results[sha]
                         commit_meta['is_reverted'] = revert_status.get('is_reverted', False)
                         commit_meta['revert_at'] = revert_status.get('revert_at')
-                    
+
                     # Group by date
                     commit_at = commit_meta.get('commit_at')
                     if commit_at:
@@ -970,54 +973,62 @@ def update_revert_status_for_recent_commits(token_pool):
                         except Exception:
                             pass
 
-            # Save updated commits for this agent (by date)
+            # Save updated commits for this agent (by date) - BATCH UPLOAD
             if commits_by_date:
-                print(f"   💾 Saving {sum(len(commits) for commits in commits_by_date.values())} updated commits for {agent_id}")
-                
-                # Save each date's commits
-                for (year, month, day), day_commits in commits_by_date.items():
-                    filename = f"{agent_id}/{year}.{month:02d}.{day:02d}.jsonl"
-                    local_filename = f"{year}.{month:02d}.{day:02d}.jsonl"
-                    
-                    try:
-                        # Download existing file
-                        file_path = hf_hub_download(
-                            repo_id=COMMIT_METADATA_REPO,
-                            filename=filename,
-                            repo_type="dataset",
-                            token=get_hf_token()
-                        )
-                        existing_metadata = load_jsonl(file_path)
-                    except Exception:
-                        existing_metadata = []
-                    
-                    # Merge with updated commits (deduplicate by sha)
-                    existing_by_sha = {meta['sha']: meta for meta in existing_metadata if meta.get('sha')}
-                    new_by_sha = {meta['sha']: meta for meta in day_commits if meta.get('sha')}
-                    
-                    # Update with new revert status
-                    existing_by_sha.update(new_by_sha)
-                    merged_metadata = list(existing_by_sha.values())
-                    
-                    # Save locally
-                    save_jsonl(local_filename, merged_metadata)
-                    
-                    try:
-                        # Upload to HuggingFace
-                        api = HfApi()
-                        upload_with_retry(
-                            api=api,
-                            path_or_fileobj=local_filename,
-                            path_in_repo=filename,
-                            repo_id=COMMIT_METADATA_REPO,
-                            repo_type="dataset",
-                            token=get_hf_token()
-                        )
-                    finally:
-                        # Clean up local file
-                        if os.path.exists(local_filename):
-                            os.remove(local_filename)
-                
+                print(f"   💾 Preparing batch upload for {agent_id} ({len(commits_by_date)} date(s))...")
+
+                # Create temporary directory for this agent
+                temp_dir = tempfile.mkdtemp(prefix=f"hf_revert_update_{agent_id}_")
+                agent_folder = os.path.join(temp_dir, agent_id)
+                os.makedirs(agent_folder, exist_ok=True)
+
+                try:
+                    # Prepare all daily files for this agent
+                    for (year, month, day), day_commits in commits_by_date.items():
+                        filename = f"{agent_id}/{year}.{month:02d}.{day:02d}.jsonl"
+                        local_filename = os.path.join(agent_folder, f"{year}.{month:02d}.{day:02d}.jsonl")
+
+                        try:
+                            # Download existing file
+                            file_path = hf_hub_download(
+                                repo_id=COMMIT_METADATA_REPO,
+                                filename=filename,
+                                repo_type="dataset",
+                                token=get_hf_token()
+                            )
+                            existing_metadata = load_jsonl(file_path)
+                        except Exception:
+                            existing_metadata = []
+
+                        # Merge with updated commits (deduplicate by sha)
+                        existing_by_sha = {meta['sha']: meta for meta in existing_metadata if meta.get('sha')}
+                        new_by_sha = {meta['sha']: meta for meta in day_commits if meta.get('sha')}
+
+                        # Update with new revert status
+                        existing_by_sha.update(new_by_sha)
+                        merged_metadata = list(existing_by_sha.values())
+
+                        # Save to temp directory
+                        save_jsonl(local_filename, merged_metadata)
+                        print(f"      ✓ Prepared {filename}")
+
+                    # Batch upload all files for this agent in a single commit
+                    print(f"   📤 Uploading {len(commits_by_date)} file(s) for {agent_id}...")
+                    api = HfApi()
+                    api.upload_folder(
+                        folder_path=temp_dir,
+                        repo_id=COMMIT_METADATA_REPO,
+                        repo_type="dataset",
+                        token=get_hf_token(),
+                        commit_message=f"Batch revert status update: {agent_id} ({len(commits_by_date)} daily files)"
+                    )
+                    print(f"      ✅ Batch upload complete for {agent_id}!")
+
+                finally:
+                    # Clean up temp directory
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
+
                 total_updated += len(commits_by_sha)
         else:
             print(f"   🐛 DEBUG MODE: Skipping revert status update")
@@ -1181,11 +1192,15 @@ def save_commit_metadata_to_hf(metadata_list, agent_identifier):
     In debug mode, saves to in-memory cache only.
 
     This function APPENDS new metadata and DEDUPLICATES by sha.
+    Uses BATCH UPLOAD to avoid HuggingFace rate limits (256 commits/hour).
 
     Args:
         metadata_list: List of commit metadata dictionaries
         agent_identifier: GitHub identifier of the agent (used as folder name)
     """
+    import tempfile
+    import shutil
+
     # Skip saving to HF in debug mode - use in-memory cache instead
     if DEBUG_MODE:
         global DEBUG_COMMIT_METADATA_CACHE
@@ -1207,52 +1222,64 @@ def save_commit_metadata_to_hf(metadata_list, agent_identifier):
         # Group by exact date (year, month, day)
         grouped = group_metadata_by_date(metadata_list)
 
-        for (commit_year, month, day), day_metadata in grouped.items():
-            # New structure: [agent_identifier]/YYYY.MM.DD.jsonl
-            filename = f"{agent_identifier}/{commit_year}.{month:02d}.{day:02d}.jsonl"
-            local_filename = f"{commit_year}.{month:02d}.{day:02d}.jsonl"
-            print(f"📤 Uploading {len(day_metadata)} commits to {filename}...")
+        if not grouped:
+            print("   No metadata to save")
+            return True
 
-            # Download existing file if it exists
-            existing_metadata = []
-            try:
-                file_path = hf_hub_download(
-                    repo_id=COMMIT_METADATA_REPO,
-                    filename=filename,
-                    repo_type="dataset",
-                    token=token
-                )
-                existing_metadata = load_jsonl(file_path)
-                print(f"   Found {len(existing_metadata)} existing commits in {filename}")
-            except Exception:
-                print(f"   No existing file found for {filename}, creating new")
+        # Create temporary directory for batch upload
+        temp_dir = tempfile.mkdtemp(prefix=f"hf_upload_{agent_identifier}_")
+        agent_folder = os.path.join(temp_dir, agent_identifier)
+        os.makedirs(agent_folder, exist_ok=True)
 
-            # Merge and deduplicate by sha
-            existing_by_sha = {meta['sha']: meta for meta in existing_metadata if meta.get('sha')}
-            new_by_sha = {meta['sha']: meta for meta in day_metadata if meta.get('sha')}
+        try:
+            print(f"📦 Preparing batch upload for {len(grouped)} daily file(s)...")
 
-            # Update with new data (new data overwrites old)
-            existing_by_sha.update(new_by_sha)
-            merged_metadata = list(existing_by_sha.values())
+            # Prepare all daily files in temp directory
+            for (commit_year, month, day), day_metadata in grouped.items():
+                filename = f"{agent_identifier}/{commit_year}.{month:02d}.{day:02d}.jsonl"
+                local_filename = os.path.join(agent_folder, f"{commit_year}.{month:02d}.{day:02d}.jsonl")
 
-            # Save locally
-            save_jsonl(local_filename, merged_metadata)
+                # Download existing file if it exists
+                existing_metadata = []
+                try:
+                    file_path = hf_hub_download(
+                        repo_id=COMMIT_METADATA_REPO,
+                        filename=filename,
+                        repo_type="dataset",
+                        token=token
+                    )
+                    existing_metadata = load_jsonl(file_path)
+                    print(f"   Found {len(existing_metadata)} existing commits in {filename}")
+                except Exception:
+                    print(f"   Creating new file: {filename}")
 
-            try:
-                # Upload to HuggingFace with folder path
-                upload_with_retry(
-                    api=api,
-                    path_or_fileobj=local_filename,
-                    path_in_repo=filename,
-                    repo_id=COMMIT_METADATA_REPO,
-                    repo_type="dataset",
-                    token=token
-                )
-                print(f"   ✓ Saved {len(merged_metadata)} total commits to {filename}")
-            finally:
-                # Always clean up local file, even if upload fails
-                if os.path.exists(local_filename):
-                    os.remove(local_filename)
+                # Merge and deduplicate by sha
+                existing_by_sha = {meta['sha']: meta for meta in existing_metadata if meta.get('sha')}
+                new_by_sha = {meta['sha']: meta for meta in day_metadata if meta.get('sha')}
+
+                # Update with new data (new data overwrites old)
+                existing_by_sha.update(new_by_sha)
+                merged_metadata = list(existing_by_sha.values())
+
+                # Save to temp directory
+                save_jsonl(local_filename, merged_metadata)
+                print(f"   ✓ Prepared {len(merged_metadata)} commits for {filename}")
+
+            # Batch upload entire folder (single commit instead of N commits)
+            print(f"📤 Uploading {len(grouped)} file(s) in single batch commit...")
+            api.upload_folder(
+                folder_path=temp_dir,
+                repo_id=COMMIT_METADATA_REPO,
+                repo_type="dataset",
+                token=token,
+                commit_message=f"Batch update: {agent_identifier} ({len(grouped)} daily files)"
+            )
+            print(f"   ✅ Batch upload complete!")
+
+        finally:
+            # Clean up temp directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
 
         return True
 
